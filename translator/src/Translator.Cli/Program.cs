@@ -38,7 +38,15 @@ CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
 
 var command = args.Length > 0 ? args[0] : "info";
 var (projectOption, tailWithoutProject) = ExtractOption(args.Skip(1).ToArray(), "--project");
-var (profileOption, tail) = ExtractOption(tailWithoutProject, "--profile");
+var (profileOption, tailWithoutProfile) = ExtractOption(tailWithoutProject, "--profile");
+var (targetOption, tail) = ExtractOption(tailWithoutProfile, "--target");
+// Native output targets the host OS; a web build is produced on a native host for WebAssembly.
+TranslationTarget.ObjectFormat = targetOption switch
+{
+    null or "native" => TranslationTarget.HostObjectFormat,
+    "web" => NativeObjectFormat.WebAssembly,
+    _ => throw new ArgumentException($"--target must be 'native' or 'web', not '{targetOption}'.")
+};
 var project = !string.IsNullOrWhiteSpace(projectOption)
     ? TranslationProjectConfig.Load(projectOption)
     : null;
@@ -3562,7 +3570,7 @@ static void WriteUsage(TextWriter writer, IReadOnlyList<string> commands)
     {
         writer.WriteLine(CommandUsage(name));
     }
-    writer.WriteLine("Every command also accepts [--project path] [--profile name] [--prefer-cached-inputs] [--help].");
+    writer.WriteLine("Every command also accepts [--project path] [--profile name] [--target native|web] [--prefer-cached-inputs] [--help].");
 }
 
 static string[] KnownCommands() => new[]
