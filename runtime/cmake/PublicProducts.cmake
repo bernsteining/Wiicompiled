@@ -261,6 +261,11 @@ function(mkw_configure_product target)
         endforeach()
     endif()
 
+    if(MKW_PLATFORM_WEB)
+        mkw_configure_web_product(${target})
+        return()
+    endif()
+
     set(MKW_WII_BOOTSTRAP_SOURCE_DIR "${MKW_RUNTIME_SOURCE_DIR}/assets/wii")
     if(NOT EXISTS "${MKW_WII_BOOTSTRAP_SOURCE_DIR}/shared2/wc24")
         message(FATAL_ERROR "Missing Wii first-run bootstrap payload: ${MKW_WII_BOOTSTRAP_SOURCE_DIR}")

@@ -10,7 +10,13 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
 endif()
 project(mkw_recompiled)
 
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(EMSCRIPTEN)
+    # WebAssembly (wasm32): Emscripten's Clang. Pointers are 32-bit there; guest memory does not
+    # depend on a 64-bit host address space on this target (see web/guest_flat_memory_wasm.cpp).
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^Clang$")
+        message(FATAL_ERROR "WiiCompiled's web build requires Emscripten's Clang")
+    endif()
+elseif(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
 endif()
 
@@ -26,7 +32,9 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_SYSTEM_PROCESSOR "${_mkw_osx_arch}")
 endif()
 
-if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+if(EMSCRIPTEN)
+    set(MKW_PLATFORM_WEB TRUE)
+elseif(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(MKW_PLATFORM_WINDOWS TRUE)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|arm64|ARM64)$")
     set(MKW_PLATFORM_MACOS TRUE)
@@ -58,6 +66,10 @@ option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
 set(MKW_PROJECT_COMPILE_DEFINITIONS NOMINMAX)
 
 set(CMAKE_CXX_STANDARD 17)
+
+if(MKW_PLATFORM_WEB)
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/Web.cmake")
+endif()
 
 # Declared before the vendored libraries so the third-party block below can
 # branch on it and so cmake/NativePrebuilt.cmake is included after the names it
@@ -214,7 +226,9 @@ else()
         message(FATAL_ERROR "Requested aurora-main but ${MKW_AURORA_DIR} is missing")
     endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
-    if(MKW_PLATFORM_WINDOWS)
+    if(MKW_PLATFORM_WEB)
+        # The browser provides WebGPU (aurora's emdawnwebgpu provider); no Dawn backends.
+    elseif(MKW_PLATFORM_WINDOWS)
         set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
@@ -318,7 +332,9 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
-if(MKW_PLATFORM_MACOS)
+if(MKW_PLATFORM_WEB)
+    mkw_web_select_sources(SOURCES)
+elseif(MKW_PLATFORM_MACOS)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
     if(MKW_PLATFORM_MACOS_ARM64)
         # HostContext's Apple Silicon backend is implemented in a small assembly
@@ -365,10 +381,18 @@ if(MKW_BUILD_PSQ_TESTS)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
         target_compile_options(mkw_psq_helpers_tests PRIVATE -march=x86-64-v3)
     endif()
+    if(MKW_PLATFORM_WEB)
+        # Exit codes (the reserved-encoding cases expect 86) only reach Node with EXIT_RUNTIME.
+        target_link_options(mkw_psq_helpers_tests PRIVATE -sEXIT_RUNTIME=1)
+    endif()
     set_target_properties(mkw_psq_helpers_tests PROPERTIES UNITY_BUILD OFF)
     add_test(NAME mkw_psq_helpers_tests COMMAND mkw_psq_helpers_tests)
     add_test(NAME mkw_psq_reserved_tests COMMAND "${CMAKE_COMMAND}"
         "-DPSQ_TEST_EXECUTABLE=$<TARGET_FILE:mkw_psq_helpers_tests>"
+        "-DPSQ_TEST_EMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
+        # WebAssembly cannot catch abort() with a SIGABRT handler; there the test expects
+        # Emscripten's abort instead of exit code 86.
+        "-DPSQ_TEST_ABORT_MARKER=$<$<BOOL:${MKW_PLATFORM_WEB}>:Aborted(>"
         -P "${CMAKE_CURRENT_LIST_DIR}/tests/psq_reserved_tests.cmake")
 endif()
 
@@ -392,6 +416,12 @@ add_test(NAME mkw_nand_save_tests COMMAND mkw_nand_save_tests)
 add_executable(mkw_nand_settings_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_settings_tests.cpp")
 find_package(Threads REQUIRED)
 target_link_libraries(mkw_nand_settings_tests PRIVATE Threads::Threads)
+if(MKW_PLATFORM_WEB)
+    # The test itself races host threads; the web runtime does not, but the test still needs
+    # Emscripten pthreads (Web Workers) to run.
+    target_compile_options(mkw_nand_settings_tests PRIVATE -pthread)
+    target_link_options(mkw_nand_settings_tests PRIVATE -pthread -sPTHREAD_POOL_SIZE=8 -sEXIT_RUNTIME=1)
+endif()
 target_include_directories(mkw_nand_settings_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_compile_features(mkw_nand_settings_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_nand_settings_tests COMMAND mkw_nand_settings_tests)
@@ -469,6 +499,41 @@ if(MKW_PLATFORM_MACOS)
     add_test(NAME mkw_macos_external_audio_tests COMMAND mkw_macos_external_audio_tests)
 endif()
 
+# Floating-point ISA semantics, compared helper by helper with the x86-64 reference (the build
+# verified against Dolphin and hardware). Other hosts must produce identical hashes; the web build
+# allowlists one native x86 quirk (see tests/fp_semantics_tests.cpp and docs/wasm-port.md).
+# On x86-64 the test only checks that the reference is current, so it is opt-in there.
+option(MKW_BUILD_FP_SEMANTICS_TESTS "Build mkw_fp_semantics_tests on x86-64 (always built for the web)" OFF)
+if(MKW_PLATFORM_WEB OR (MKW_BUILD_FP_SEMANTICS_TESTS AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$"))
+    add_executable(mkw_fp_semantics_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/fp_semantics_tests.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp")
+    target_include_directories(mkw_fp_semantics_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/tests/psq_memory"
+        "${CMAKE_CURRENT_LIST_DIR}/include/isa"
+        "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_fp_semantics_tests PRIVATE cxx_std_17)
+    target_compile_options(mkw_fp_semantics_tests PRIVATE
+        -O2 ${MKW_TRANSLATED_PPC_FP_OPTIONS} -fno-slp-vectorize)
+    if(MKW_PLATFORM_WEB)
+        target_link_options(mkw_fp_semantics_tests PRIVATE -sEXIT_RUNTIME=1)
+        set(MKW_FP_ALLOWED "frsqrte ni=1")
+    else()
+        target_compile_options(mkw_fp_semantics_tests PRIVATE -march=x86-64-v3)
+        set(MKW_FP_ALLOWED "")
+    endif()
+    set_target_properties(mkw_fp_semantics_tests PROPERTIES UNITY_BUILD OFF)
+    add_test(NAME mkw_fp_semantics_tests COMMAND "${CMAKE_COMMAND}"
+        "-DFP_TEST_COMMAND=${CMAKE_CROSSCOMPILING_EMULATOR};$<TARGET_FILE:mkw_fp_semantics_tests>"
+        "-DFP_REFERENCE=${CMAKE_CURRENT_LIST_DIR}/tests/fp_semantics_x86_64_reference.txt"
+        "-DFP_ALLOWED=${MKW_FP_ALLOWED}"
+        -P "${CMAKE_CURRENT_LIST_DIR}/tests/fp_semantics_compare.cmake")
+endif()
+
+if(MKW_PLATFORM_WEB)
+    mkw_web_add_tests()
+endif()
+
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
 # files and of optional Retro Rewind artifacts such as code.map.
@@ -524,6 +589,9 @@ else()
             target_compile_options(mkw_macos_native_compile PRIVATE -march=x86-64-v3)
         endif()
         set_target_properties(mkw_macos_native_compile PROPERTIES UNITY_BUILD OFF)
+    endif()
+    if(MKW_PLATFORM_WEB)
+        mkw_web_add_compile_audit("${SOURCES}")
     endif()
     add_custom_target(mkw_platform_paths_check DEPENDS mkw_platform)
     message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
