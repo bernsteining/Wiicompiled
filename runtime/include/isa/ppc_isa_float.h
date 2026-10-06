@@ -23,6 +23,7 @@
 
 #include "ppc_isa_config.h"
 #include "ppc_isa_context.h"
+#include "ppc_isa_fma.h"
 
 #include <array>
 #include <cmath>
@@ -84,6 +85,11 @@ using PpcPairVec = __m128;
 // Only 2 lanes are ever meaningful (a PPC paired-single register), so a 2-lane float32x2_t
 // (one 64-bit D register) is a more natural fit than mirroring x86's 128-bit register usage.
 using PpcPairVec = float32x2_t;
+#elif defined(__wasm__)
+// Same 2-lane shape as the NEON type, as a Clang generic vector. Bit-casting the packed double
+// gives lane 0 = ps1 and lane 1 = ps0 (little-endian), the same lane order as the other hosts.
+using PpcPairVec = float __attribute__((__vector_size__(8)));
+using PpcPairBits = uint32_t __attribute__((__vector_size__(8)));
 #endif
 
 // Must stay inside the vector register domain. Bitcasting through a 64-bit GPR added a movq
@@ -95,6 +101,8 @@ inline PpcPairVec PpcPsToM128Inline(double value)
     return _mm_castpd_ps(_mm_set_sd(value));
 #elif defined(__aarch64__)
     return vreinterpret_f32_f64(vdup_n_f64(value));
+#elif defined(__wasm__)
+    return __builtin_bit_cast(PpcPairVec, value);
 #endif
 }
 
@@ -104,6 +112,8 @@ inline double PpcM128ToPsInline(PpcPairVec value)
     return _mm_cvtsd_f64(_mm_castps_pd(value));
 #elif defined(__aarch64__)
     return vget_lane_f64(vreinterpret_f64_f32(value), 0);
+#elif defined(__wasm__)
+    return __builtin_bit_cast(double, value);
 #endif
 }
 
@@ -115,6 +125,9 @@ inline PpcPairVec PpcBroadcastPs0Inline(double value)
 #elif defined(__aarch64__)
     // ps0 lives in lane 1 (see the lane-accessor comment below).
     return vdup_lane_f32(PpcPsToM128Inline(value), 1);
+#elif defined(__wasm__)
+    const PpcPairVec lanes = PpcPsToM128Inline(value);
+    return __builtin_shufflevector(lanes, lanes, 1, 1);
 #endif
 }
 
@@ -126,6 +139,9 @@ inline PpcPairVec PpcBroadcastPs1Inline(double value)
 #elif defined(__aarch64__)
     // ps1 is already lane 0.
     return vdup_lane_f32(PpcPsToM128Inline(value), 0);
+#elif defined(__wasm__)
+    const PpcPairVec lanes = PpcPsToM128Inline(value);
+    return __builtin_shufflevector(lanes, lanes, 0, 0);
 #endif
 }
 
@@ -142,6 +158,11 @@ inline PpcPairVec PpcNegateNonNanLanesInline(PpcPairVec value)
     // NEON has no direct "ordered compare"; a value compares equal to itself iff it's not NaN.
     const uint32x2_t ordered = vceq_f32(value, value);
     return vbsl_f32(ordered, negated, value);
+#elif defined(__wasm__)
+    // A lane compares equal to itself iff it is not NaN; only those lanes get the sign flip.
+    const PpcPairBits ordered = __builtin_bit_cast(PpcPairBits, value == value);
+    return __builtin_bit_cast(PpcPairVec,
+        __builtin_bit_cast(PpcPairBits, value) ^ (ordered & 0x80000000u));
 #endif
 }
 
@@ -157,6 +178,8 @@ inline float PpcGetPs0Inline(double value)
     return _mm_cvtss_f32(PpcBroadcastPs0Inline(value));
 #elif defined(__aarch64__)
     return vget_lane_f32(PpcBroadcastPs0Inline(value), 0);
+#elif defined(__wasm__)
+    return PpcPsToM128Inline(value)[1];
 #endif
 }
 
@@ -167,6 +190,8 @@ inline float PpcGetPs1Inline(double value)
     return _mm_cvtss_f32(PpcPsToM128Inline(value));
 #elif defined(__aarch64__)
     return vget_lane_f32(PpcPsToM128Inline(value), 0);
+#elif defined(__wasm__)
+    return PpcPsToM128Inline(value)[0];
 #endif
 }
 
@@ -180,16 +205,45 @@ inline double PpcPackPairedInline(float ps0, float ps1)
     // Lane 0 = ps1, lane 1 = ps0, matching the union layout bit for bit.
     const float32x2_t lane0 = vdup_n_f32(ps1);
     return PpcM128ToPsInline(vset_lane_f32(ps0, lane0, 1));
+#elif defined(__wasm__)
+    return PpcM128ToPsInline(PpcPairVec{ps1, ps0});
 #endif
 }
 
 // FPSCR[NI] is modeled by MXCSR FTZ/DAZ, so arithmetic output flushing compiles to nothing.
 // Two cases still need a software check against the mirrored bit (not STMXCSR, too hot):
 // double->single conversion (CVTSD2SS isn't covered by FTZ) and raw lane pass-through moves.
+// WebAssembly has no FTZ/DAZ at all; there the paired arithmetic helpers below flush their own
+// inputs and outputs while g_mkwHostNiActive is set (see PpcWasmFlushPairInline).
 inline bool MkwHostNiActiveInline() noexcept
 {
     return g_mkwHostNiActive;
 }
+
+// The host FP environment applied to one value, a conversion or an FMA. While NI is set, MXCSR
+// FTZ|DAZ (x86-64) and FPCR.FZ (AArch64) flush every denormal operand and result in hardware, so
+// on those hosts these are the plain operations. WebAssembly has no such mode: ppc_isa_float_wasm.h
+// replays what that hardware does, and also holds the wasm paired-single arithmetic.
+#if defined(__wasm__)
+#include "ppc_isa_float_wasm.h"
+#else
+inline double PpcHostNiFlushF64(double value) noexcept { return value; }
+inline float PpcHostNiFlushF32(float value) noexcept { return value; }
+inline double PpcHostPromoteInline(float value) noexcept { return static_cast<double>(value); }
+inline float PpcHostDemoteInline(double value) noexcept { return static_cast<float>(value); }
+
+template <bool Subtract>
+inline double PpcHostFusedF64(double a, double c, double b)
+{
+    return Subtract ? MkwFusedMulSubF64(a, c, b) : MkwFusedMulAddF64(a, c, b);
+}
+
+template <bool Subtract>
+inline float PpcHostFusedF32(float a, float c, float b)
+{
+    return Subtract ? MkwFusedMulSubF32(a, c, b) : MkwFusedMulAddF32(a, c, b);
+}
+#endif
 
 inline float PpcForceSingleValueInline(double value)
 {
@@ -213,6 +267,11 @@ inline float PpcForceSingleValueInline(double value)
     const uint64x1_t signOnly = vand_u64(vreinterpret_u64_f64(v), signMask);
     const uint64x1_t kept = vbsl_u64(flush, signOnly, vreinterpret_u64_f64(v));
     return static_cast<float>(vget_lane_f64(vreinterpret_f64_u64(kept), 0));
+#elif defined(__wasm__)
+    const uint64_t bits = PpcBitCastToU64Inline(value);
+    const double magnitude = PpcBitCastToDoubleInline(bits & 0x7FFFFFFFFFFFFFFFULL);
+    const uint64_t kept = magnitude < g_mkwNiFlushThreshold ? (bits & 0x8000000000000000ULL) : bits;
+    return PpcHostDemoteInline(PpcBitCastToDoubleInline(kept));
 #endif
 }
 
@@ -228,7 +287,8 @@ inline float PpcFlushSingleForNiInline(float value)
 
 inline double PpcFlushPairedForNiInline(double value)
 {
-    // Callers pass results of SSE arithmetic; MXCSR.FTZ already flushed them.
+    // Callers pass results of SSE arithmetic; MXCSR.FTZ already flushed them. On WebAssembly the
+    // pair arithmetic helpers flush their own results, which is the same contract.
     return value;
 }
 
@@ -422,19 +482,17 @@ inline double PpcPackIntegerWordInline(int32_t value)
 template <bool Subtract>
 inline float PpcAccuratePsMaddLaneInline(float a, float c, float b)
 {
-    const float signedB = Subtract ? -b : b;
     // Paired values are stored as exact float32 lanes in this runtime.  An
     // explicit float FMA therefore matches Gekko's single rounding point;
     // multiplying and adding separately can differ by an ULP on ordinary
     // vector and matrix workloads.
-    return PpcFlushSingleForNiInline(std::fma(a, c, signedB));
+    return PpcFlushSingleForNiInline(PpcHostFusedF32<Subtract>(a, c, b));
 }
 
 template <bool Subtract>
 inline float PpcAccuratePsMaddLaneNoNiInline(float a, float c, float b)
 {
-    const float signedB = Subtract ? -b : b;
-    return std::fma(a, c, signedB);
+    return Subtract ? MkwFusedMulSubF32(a, c, b) : MkwFusedMulAddF32(a, c, b);
 }
 
 template <bool Subtract>
@@ -447,17 +505,18 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
     // Recover the direction of that discarded error for those tie cases.
     const double roundedC = PpcForce25BitInline(c);
     const double signedB = Subtract ? -b : b;
-    double result = std::fma(a, roundedC, signedB);
+    double result = PpcHostFusedF64<Subtract>(a, roundedC, b);
     const uint64_t resultBits = PpcBitCastToU64Inline(result);
     constexpr uint64_t kDiscardedMask = 0x000000001FFFFFFFULL;
     constexpr uint64_t kEvenTie = 0x0000000010000000ULL;
     if ((resultBits & kDiscardedMask) == kEvenTie)
     {
-        const double aPrime = signedB - result;
-        const double bPrime = result + aPrime;
-        const double deltaA = std::fma(a, roundedC, aPrime);
-        const double deltaB = signedB - bPrime;
-        const double error = deltaA + deltaB;
+        const double flushedB = PpcHostNiFlushF64(signedB);
+        const double aPrime = PpcHostNiFlushF64(flushedB - result);
+        const double bPrime = PpcHostNiFlushF64(result + aPrime);
+        const double deltaA = PpcHostFusedF64<false>(a, roundedC, aPrime);
+        const double deltaB = PpcHostNiFlushF64(flushedB - bPrime);
+        const double error = PpcHostNiFlushF64(deltaA + deltaB);
         if (error != 0.0)
         {
             result = PpcBitCastToDoubleInline(
@@ -469,8 +528,9 @@ inline double PpcAccurateSingleMaddIntermediateInline(double a, double c, double
 
 inline double PpcFmulsInline(double a, double c)
 {
-    return static_cast<double>(
-        PpcForceSingleValueInline(a * PpcForce25BitInline(c)));
+    const double product = PpcHostNiFlushF64(
+        PpcHostNiFlushF64(a) * PpcHostNiFlushF64(PpcForce25BitInline(c)));
+    return static_cast<double>(PpcForceSingleValueInline(product));
 }
 
 inline double PpcFmulsNoNiInline(double a, double c)
@@ -480,23 +540,23 @@ inline double PpcFmulsNoNiInline(double a, double c)
 
 inline double PpcFmaddInline(double a, double c, double b)
 {
-    return std::fma(a, c, b);
+    return PpcHostFusedF64<false>(a, c, b);
 }
 
 inline double PpcFmsubInline(double a, double c, double b)
 {
-    return std::fma(a, c, -b);
+    return PpcHostFusedF64<true>(a, c, b);
 }
 
 inline double PpcFnmaddInline(double a, double c, double b)
 {
-    const double result = std::fma(a, c, b);
+    const double result = PpcHostFusedF64<false>(a, c, b);
     return std::isnan(result) ? result : -result;
 }
 
 inline double PpcFnmsubInline(double a, double c, double b)
 {
-    const double result = std::fma(a, c, -b);
+    const double result = PpcHostFusedF64<true>(a, c, b);
     return std::isnan(result) ? result : -result;
 }
 
@@ -580,6 +640,8 @@ inline PpcPairVec PpcMulPairInline(PpcPairVec lhs, PpcPairVec rhs)
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanesInline(result, lhs, rhs);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairArithmeticInline(lhs, rhs, [](auto a, auto b) { return a * b; });
 #endif
 }
 
@@ -613,6 +675,8 @@ inline PpcPairVec PpcFmaddPairInline(PpcPairVec multiplicand, PpcPairVec multipl
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, addend);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairFusedInline<false>(multiplicand, multiplier, addend);
 #endif
 }
 
@@ -625,6 +689,8 @@ inline PpcPairVec PpcFmsubPairInline(PpcPairVec multiplicand, PpcPairVec multipl
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanes3Inline(result, multiplicand, multiplier, subtractor);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairFusedInline<true>(multiplicand, multiplier, subtractor);
 #endif
 }
 
@@ -699,19 +765,19 @@ inline double PPC_PsFromScalarInline(double value)
     // "scalar to paired" instruction, so there is no NI rounding point here.
     // If the scalar is a single-denormal it stays one; MXCSR.DAZ flushes it as
     // an input at the next real arithmetic op, exactly like the hardware.
-    const float single = static_cast<float>(value);
+    const float single = PpcHostDemoteInline(value);
     return PpcPackPairedInline(single, single);
 }
 
 inline double PPC_PsFromScalarNoNiInline(double value)
 {
-    const float single = static_cast<float>(value);
+    const float single = PpcHostDemoteInline(value);
     return PpcPackPairedInline(single, single);
 }
 
 inline double PPC_PsToScalarInline(double value)
 {
-    return static_cast<double>(PpcGetPs0Inline(value));
+    return PpcHostPromoteInline(PpcGetPs0Inline(value));
 }
 
 // ps_merge* are pure lane selections (result.ps0 from frA, result.ps1 from frB). On x86 two
@@ -726,7 +792,7 @@ inline double PPC_PsMerge00Inline(double aValue, double bValue)
     const __m128 gathered = _mm_shuffle_ps(
         PpcPsToM128Inline(bValue), PpcPsToM128Inline(aValue), _MM_SHUFFLE(1, 1, 1, 1));
     return PpcM128ToPsInline(_mm_shuffle_ps(gathered, gathered, _MM_SHUFFLE(0, 0, 2, 0)));
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__wasm__)
     return PpcPackPairedInline(PpcGetPs0Inline(aValue), PpcGetPs0Inline(bValue));
 #endif
 }
@@ -738,7 +804,7 @@ inline double PPC_PsMerge01Inline(double aValue, double bValue)
     const __m128 gathered = _mm_shuffle_ps(
         PpcPsToM128Inline(bValue), PpcPsToM128Inline(aValue), _MM_SHUFFLE(1, 1, 0, 0));
     return PpcM128ToPsInline(_mm_shuffle_ps(gathered, gathered, _MM_SHUFFLE(0, 0, 2, 0)));
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__wasm__)
     return PpcPackPairedInline(PpcGetPs0Inline(aValue), PpcGetPs1Inline(bValue));
 #endif
 }
@@ -750,7 +816,7 @@ inline double PPC_PsMerge10Inline(double aValue, double bValue)
     const __m128 gathered = _mm_shuffle_ps(
         PpcPsToM128Inline(bValue), PpcPsToM128Inline(aValue), _MM_SHUFFLE(0, 0, 1, 1));
     return PpcM128ToPsInline(_mm_shuffle_ps(gathered, gathered, _MM_SHUFFLE(0, 0, 2, 0)));
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__wasm__)
     return PpcPackPairedInline(PpcGetPs1Inline(aValue), PpcGetPs0Inline(bValue));
 #endif
 }
@@ -762,7 +828,7 @@ inline double PPC_PsMerge11Inline(double aValue, double bValue)
 #if defined(__x86_64__)
     return PpcM128ToPsInline(
         _mm_unpacklo_ps(PpcPsToM128Inline(bValue), PpcPsToM128Inline(aValue)));
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__wasm__)
     return PpcPackPairedInline(PpcGetPs1Inline(aValue), PpcGetPs1Inline(bValue));
 #endif
 }
@@ -776,6 +842,8 @@ inline PpcPairVec PpcAddPairInline(PpcPairVec lhs, PpcPairVec rhs)
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanesInline(result, lhs, rhs);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairArithmeticInline(lhs, rhs, [](auto a, auto b) { return a + b; });
 #endif
 }
 
@@ -788,6 +856,8 @@ inline PpcPairVec PpcSubPairInline(PpcPairVec lhs, PpcPairVec rhs)
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanesInline(result, lhs, rhs);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairArithmeticInline(lhs, rhs, [](auto a, auto b) { return a - b; });
 #endif
 }
 
@@ -800,6 +870,8 @@ inline PpcPairVec PpcDivPairInline(PpcPairVec lhs, PpcPairVec rhs)
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
         return PpcResolveNanLanesInline(result, lhs, rhs);
     return result;
+#elif defined(__wasm__)
+    return PpcWasmPairArithmeticInline(lhs, rhs, [](auto a, auto b) { return a / b; });
 #endif
 }
 
@@ -824,8 +896,8 @@ inline double PPC_PsSelInline(double lhsValue, double controlValue, double rhsVa
     const float rhs0 = PpcGetPs0Inline(rhsValue);
     const float rhs1 = PpcGetPs1Inline(rhsValue);
     return PpcPackPairedInline(
-        control0 >= -0.0f ? lhs0 : rhs0,
-        control1 >= -0.0f ? lhs1 : rhs1);
+        PpcHostNiFlushF32(control0) >= -0.0f ? lhs0 : rhs0,
+        PpcHostNiFlushF32(control1) >= -0.0f ? lhs1 : rhs1);
 }
 
 inline double PPC_PsSubInline(double aValue, double bValue)
@@ -859,7 +931,8 @@ inline double PPC_PsAbsInline(double value)
 inline double PPC_PsSum0Inline(double aValue, double bValue, double cValue)
 {
     return PpcPackPairedInline(
-        PpcForceSingleValueInline(static_cast<double>(PpcGetPs0Inline(aValue)) + PpcGetPs1Inline(bValue)),
+        PpcForceSingleValueInline(
+            PpcHostPromoteInline(PpcGetPs0Inline(aValue)) + PpcHostPromoteInline(PpcGetPs1Inline(bValue))),
         PpcFlushSingleForNiInline(PpcGetPs1Inline(cValue)));
 }
 
@@ -867,7 +940,8 @@ inline double PPC_PsSum1Inline(double aValue, double bValue, double cValue)
 {
     return PpcPackPairedInline(
         PpcFlushSingleForNiInline(PpcGetPs0Inline(cValue)),
-        PpcForceSingleValueInline(static_cast<double>(PpcGetPs0Inline(aValue)) + PpcGetPs1Inline(bValue)));
+        PpcForceSingleValueInline(
+            PpcHostPromoteInline(PpcGetPs0Inline(aValue)) + PpcHostPromoteInline(PpcGetPs1Inline(bValue))));
 }
 
 inline uint32_t PpcConvertToSingleFTZInline(uint64_t value)
@@ -949,10 +1023,10 @@ extern "C" double PPC_PsSel(double lhs, double control, double rhs);
 // the old ppc_helpers.cpp body (both used PpcApproximateReciprocalInline).
 extern "C" inline double PPC_PsRes(double value)
 {
-    const float ps0 = static_cast<float>(
-        PpcApproximateReciprocalInline(static_cast<double>(PpcGetPs0Inline(value))));
-    const float ps1 = static_cast<float>(
-        PpcApproximateReciprocalInline(static_cast<double>(PpcGetPs1Inline(value))));
+    const float ps0 = PpcHostDemoteInline(
+        PpcApproximateReciprocalInline(PpcHostPromoteInline(PpcGetPs0Inline(value))));
+    const float ps1 = PpcHostDemoteInline(
+        PpcApproximateReciprocalInline(PpcHostPromoteInline(PpcGetPs1Inline(value))));
     return PpcPackPairedInline(ps0, ps1);
 }
 
@@ -976,8 +1050,8 @@ extern "C" inline double PPC_Fres(double value)
 {
     // The generated paired/scalar boundary presents fres as a packed input and
     // expects its architecturally replicated single result in the same format.
-    const float result = static_cast<float>(
-        PpcApproximateReciprocalInline(static_cast<double>(PpcGetPs0Inline(value))));
+    const float result = PpcHostDemoteInline(
+        PpcApproximateReciprocalInline(PpcHostPromoteInline(PpcGetPs0Inline(value))));
     return PpcPackPairedInline(result, result);
 }
 
@@ -993,7 +1067,7 @@ extern "C" inline double PPC_Fsel(double control, double negative, double positi
 {
     // Dolphin models fsel/ps_sel as "fra >= -0.0 ? frC : frB".
     // That comparison deliberately sends unordered/NaN controls to frB.
-    return (control >= -0.0) ? positive : negative;
+    return (PpcHostNiFlushF64(control) >= -0.0) ? positive : negative;
 }
 
 // PowerPC fctiwz instruction: Float Convert to Integer Word with Round toward

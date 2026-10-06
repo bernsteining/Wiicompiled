@@ -8,6 +8,10 @@
 #include <immintrin.h>
 #elif defined(__aarch64__)
 #include <arm_neon.h>
+#elif defined(__wasm__)
+// WebAssembly uses Clang's generic vector extensions, which lower to SIMD128
+// when -msimd128 is on and to scalar code otherwise. The relaxed-SIMD FMA is
+// reached through its builtin; see ppc_isa_fma.h.
 #else
 #error "ppc_isa_config.h has no SIMD intrinsics header for this architecture"
 #endif
@@ -27,7 +31,12 @@ inline constexpr bool MkwStateFreeAbiEnabled(uint32_t) noexcept
 // __regcall has no portable non-Windows equivalent worth chasing here - the extra register
 // args it saves matter for the hot PPC interpreter loop on Windows, but plain calls are fine
 // elsewhere.
+#if defined(MKW_MEASURE_HELPERS)
+// Measurement builds only (-DMKW_MEASURE_HELPERS): out-of-line helpers, so a CPU profile names them.
+#define MKW_PPC_FORCE_INLINE __attribute__((noinline)) inline
+#else
 #define MKW_PPC_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
 #define MKW_PPC_NO_INLINE __attribute__((noinline))
 #define MKW_PPC_INTERNAL_CALL
 #endif

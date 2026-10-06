@@ -1,0 +1,55 @@
+# Runs fp_semantics_tests and compares its per-helper hashes with the x86-64 reference.
+#
+#   -DFP_TEST_COMMAND=<command;args...>  how to run the test (an emulator prefix is allowed)
+#   -DFP_REFERENCE=<file>                expected output; lines starting with '#' are comments
+#   -DFP_ALLOWED=<"name ni=N";...>       helper/NI pairs allowed to differ (documented deviations)
+
+execute_process(COMMAND ${FP_TEST_COMMAND}
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+if(NOT result EQUAL 0)
+    message(FATAL_ERROR "fp_semantics_tests failed (${result}):\n${output}\n${error}")
+endif()
+
+# Each line is "<helper> ni=<0|1> n=<count> <hash>"; key the lines by "<helper> ni=<0|1>".
+function(fp_parse_lines lines prefix)
+    set(keys "")
+    foreach(line IN LISTS lines)
+        if(line MATCHES "^#" OR line STREQUAL "")
+            continue()
+        endif()
+        if(NOT line MATCHES "^([^ ]+) +(ni=[01]) +(.*)$")
+            message(FATAL_ERROR "Unparseable fp_semantics line: '${line}'")
+        endif()
+        set(key "${CMAKE_MATCH_1} ${CMAKE_MATCH_2}")
+        string(REGEX REPLACE " +" " " value "${CMAKE_MATCH_3}")
+        list(APPEND keys "${key}")
+        set(${prefix}_${key} "${value}" PARENT_SCOPE)
+    endforeach()
+    set(${prefix}_KEYS "${keys}" PARENT_SCOPE)
+endfunction()
+
+file(STRINGS "${FP_REFERENCE}" reference_lines)
+string(REPLACE "\n" ";" actual_lines "${output}")
+fp_parse_lines("${reference_lines}" REF)
+fp_parse_lines("${actual_lines}" ACT)
+
+set(failures "")
+foreach(key IN LISTS REF_KEYS)
+    if(NOT DEFINED "ACT_${key}")
+        list(APPEND failures "missing: ${key}")
+    elseif(NOT "${ACT_${key}}" STREQUAL "${REF_${key}}" AND NOT key IN_LIST FP_ALLOWED)
+        list(APPEND failures "differs: ${key} (expected ${REF_${key}}, got ${ACT_${key}})")
+    endif()
+endforeach()
+foreach(key IN LISTS ACT_KEYS)
+    if(NOT DEFINED "REF_${key}")
+        list(APPEND failures "not in reference: ${key}")
+    endif()
+endforeach()
+
+if(failures)
+    string(REPLACE ";" "\n  " failures "${failures}")
+    message(FATAL_ERROR "Floating-point semantics differ from the x86-64 reference:\n  ${failures}")
+endif()
+list(LENGTH REF_KEYS count)
+message(STATUS "fp_semantics: ${count} helper/NI results match the x86-64 reference")
