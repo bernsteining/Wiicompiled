@@ -1,0 +1,28 @@
+# Disc image reader for the web build: nod, the library the native setup extracts discs with
+# (Launcher/WiiCompiled.Setup.Common/NodToolProvider.cs, same version), behind a small C ABI.
+# Built for wasm32-unknown-emscripten and linked into mkw_disc.{js,wasm} (cmake/WebProduct.cmake),
+# which disc_worker.js runs in a Web Worker to read the player's own disc image in place.
+[package]
+name = "mkw_disc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# No "threading": a worker without shared memory runs one thread.
+nod = { git = "https://github.com/encounter/nod", tag = "v2.0.0-alpha.10", default-features = false, features = [
+    "compress-bzip2-vendored",
+    "compress-lzma-vendored",
+    "compress-zlib-vendored",
+    "compress-zstd-vendored",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
