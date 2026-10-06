@@ -573,20 +573,22 @@
     }
   }
 
-  // ?lowres: render at the Wii's own resolution ([video] resolution_multiplier = 1 in each
-  // application's Config.toml; a missing file gets the runtime's default, which is 1 too).
-  function setLowResolution() {
+  // The game's render scale ([video] resolution_multiplier in each application's Config.toml; a
+  // missing file gets the runtime's default, 1: the Wii's own 640x528). ?res=N sets N (2 = 1280x1056);
+  // ?lowres alone sets 1.
+  function setResolutionMultiplier(multiplier) {
+    const value = multiplier.toFixed(1);
     for (const name of FS.readdir('/userdata').filter((entry) => entry[0] !== '.')) {
       const path = `/userdata/${name}/Config.toml`;
       if (!FS.analyzePath(path).exists) continue;
       const text = FS.readFile(path, { encoding: 'utf8' });
       const line = /^([ \t]*resolution_multiplier[ \t]*=)[^\n]*$/m;
-      const updated = line.test(text) ? text.replace(line, '$1 1.0')
-        : /^\[video\][ \t]*$/m.test(text) ? text.replace(/^\[video\][ \t]*$/m, '[video]\nresolution_multiplier = 1.0')
-        : `${text}\n[video]\nresolution_multiplier = 1.0\n`;
+      const updated = line.test(text) ? text.replace(line, `$1 ${value}`)
+        : /^\[video\][ \t]*$/m.test(text) ? text.replace(/^\[video\][ \t]*$/m, `[video]\nresolution_multiplier = ${value}`)
+        : `${text}\n[video]\nresolution_multiplier = ${value}\n`;
       if (updated !== text) {
         FS.writeFile(path, updated);
-        out(`[web] ?lowres: resolution_multiplier = 1.0 in ${path}`);
+        out(`[web] resolution_multiplier = ${value} in ${path}`);
       }
     }
   }
@@ -649,8 +651,12 @@
 
   Module['preRun'] = [...(Module['preRun'] || []), () => {
     if (typeof location !== 'undefined' && new URLSearchParams(location.search).has('log')) traceIdbfs();
-    if (typeof location !== 'undefined' && new URLSearchParams(location.search).has('lowres')) {
-      Module['mkwUserDataLoaded'] = [setLowResolution, ...(Module['mkwUserDataLoaded'] || [])];
+    if (typeof location !== 'undefined') {
+      const params = new URLSearchParams(location.search);
+      const multiplier = Number(params.get('res')) || (params.has('lowres') ? 1 : 0);
+      if (multiplier > 0 && multiplier <= 8) {
+        Module['mkwUserDataLoaded'] = [() => setResolutionMultiplier(multiplier), ...(Module['mkwUserDataLoaded'] || [])];
+      }
     }
     addRunDependency('mkw-userdata');
     FS.mkdir('/userdata');

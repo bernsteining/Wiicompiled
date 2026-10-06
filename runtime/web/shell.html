@@ -61,11 +61,16 @@
     mkwLog(navigator.userAgent);
 
     // ?lowres: draw for a 1x display, so a high-density screen (an iPad's is 2x) fills a quarter of
-    // the pixels; the loader also sets the game's render scale to 1 (the Wii's own resolution).
-    if (new URLSearchParams(location.search).has('lowres')) {
-      // devicePixelRatio is a replaceable attribute: plain assignment shadows it everywhere.
-      window.devicePixelRatio = 1;
-      mkwLog(`lowres: devicePixelRatio ${window.devicePixelRatio}`);
+    // the pixels; the loader also sets the game's render scale to 1 (the Wii's own resolution) unless
+    // ?res=N asks for another. ?dpr=N draws for an N-x display instead (?dpr=2: an iPad's own pixels).
+    {
+      const params = new URLSearchParams(location.search);
+      const dpr = Number(params.get('dpr')) || (params.has('lowres') ? 1 : 0);
+      if (dpr > 0 && dpr <= 4) {
+        // devicePixelRatio is a replaceable attribute: plain assignment shadows it everywhere.
+        window.devicePixelRatio = dpr;
+        mkwLog(`devicePixelRatio ${window.devicePixelRatio}`);
+      }
     }
     addEventListener('error', (e) => mkwLog(`error: ${e.message} (${e.filename}:${e.lineno})`));
     // Safari's stacks leave out the message ("createBindGroup@[native code]"), so log both.
