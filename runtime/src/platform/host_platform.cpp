@@ -1,4 +1,5 @@
 #include "platform/host_platform.h"
+#include "platform/web_mounts.h"
 
 #include <cstdlib>
 
@@ -46,6 +47,9 @@ std::optional<std::filesystem::path> ExecutableDirectory() noexcept {
     std::error_code ec;
     const auto resolved = std::filesystem::weakly_canonical(path, ec);
     return (ec ? std::filesystem::path(path) : resolved).parent_path();
+#elif defined(__EMSCRIPTEN__)
+    // The web build has no executable on disk; its runtime assets are preloaded here.
+    return std::filesystem::path(WebMounts::kAppAssets);
 #else
     return std::nullopt;
 #endif
@@ -66,6 +70,8 @@ std::filesystem::path ApplicationDataDirectory(std::string_view applicationName)
     if (const passwd* user = getpwuid(getuid()); user && user->pw_dir && *user->pw_dir) {
         return std::filesystem::path(user->pw_dir) / "Library" / "Application Support" / applicationName;
     }
+#elif defined(__EMSCRIPTEN__)
+    return std::filesystem::path(WebMounts::kUserData) / applicationName;
 #endif
     return std::filesystem::current_path() / applicationName;
 }

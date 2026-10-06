@@ -24,7 +24,12 @@ namespace MemoryInline {
 #else
 // See runtime/include/isa/ppc_isa_config.h for why non-Windows Clang needs the GNU-attribute
 // spellings instead of the MS-extension keywords.
+#if defined(MKW_MEASURE_HELPERS)
+// Measurement builds only (-DMKW_MEASURE_HELPERS): out-of-line helpers, so a CPU profile names them.
+#define MKW_MEMORY_FORCE_INLINE __attribute__((noinline)) inline
+#else
 #define MKW_MEMORY_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
 #define MKW_MEMORY_NO_INLINE __attribute__((noinline))
 #endif
 #define MKW_MEMORY_COLD __attribute__((cold))
@@ -546,8 +551,18 @@ MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {
 
 template <typename T>
 MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {
+#if defined(__wasm__)
+    // No flat view: the translator-proven RAM stores (FlatWriteRam*) take the checked path like
+    // every other access, which also applies the executable-write policy the guest view's page
+    // protection gives native builds.
+    if constexpr (sizeof(T) == 1) Memory::Write8(address, value);
+    else if constexpr (sizeof(T) == 2) Memory::Write16(address, value);
+    else if constexpr (sizeof(T) == 4) Memory::Write32(address, value);
+    else Memory::Write64(address, value);
+#else
     const T swapped = MaybeByteSwap(value);
     std::memcpy(MKW_FLAT_GUEST_BASE + address, &swapped, sizeof(T));
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE uint8_t FlatRead8(uint32_t address) {

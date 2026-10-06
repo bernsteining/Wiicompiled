@@ -1,4 +1,5 @@
 #include "gx_internal.h"
+#include "platform/host_wait.h"
 #include "runtime_log.h"
 
 #include <cstdio>
@@ -74,7 +75,7 @@ void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout) {
             g_auroraFrameActive.store(true, std::memory_order_release);
             return;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        HostWait::SleepFor(std::chrono::milliseconds(1));
     }
     // Retry window expired: the aurora frame stays INACTIVE and every GX
     // command until the next EnsureAuroraFrameActive is silently dropped

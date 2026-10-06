@@ -200,6 +200,14 @@ inline bool Ensure(const std::filesystem::path& root, std::string& error,
     if (written) {
 #ifdef _WIN32
         published = MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+#elif defined(__EMSCRIPTEN__)
+        // Emscripten's file systems have no hard links. The page is the only writer of its own
+        // NAND, so a rename after re-checking that nothing was published is enough.
+        std::error_code renameError;
+        if (!std::filesystem::exists(path, renameError) && !renameError) {
+            std::filesystem::rename(temporary, path, renameError);
+            published = !renameError;
+        }
 #else
         published = ::link(temporary.c_str(), path.c_str()) == 0;
 #endif

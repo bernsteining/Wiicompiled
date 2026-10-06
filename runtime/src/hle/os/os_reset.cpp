@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "hle/audio/ax_dsp.h"
 #include "hle_stubs.h"
+#include "platform/host_wait.h"
 #include "ppc_runtime.h"
 #include "runtime_log.h"
 #include "system_bridge.h"
@@ -110,7 +111,7 @@ extern "C" void OS__Panic_801A2660_Cpu(CpuContext* ctx)
     MarkFatalErrorReported();
 
     // Give extra time for output to flush with PowerShell redirection
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    HostWait::SleepFor(std::chrono::milliseconds(200));
     
     std::exit(EXIT_FAILURE);
 }

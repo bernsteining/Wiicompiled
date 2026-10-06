@@ -6,8 +6,9 @@
 // and the host's cooperative-context facility. Windows uses native Fibers;
 // Linux and Intel macOS use libco's System V x86-64 backend. macOS AArch64 uses
 // the local assembly backend because it must preserve Darwin's platform-reserved
-// x18 register, which libco's AArch64 backend does not save. Its handles are
-// only valid on the thread that initialized the scheduler.
+// x18 register, which libco's AArch64 backend does not save. WebAssembly
+// (Emscripten) uses JSPI stack switching, see runtime/web/host_context_jspi.cpp. Its handles
+// are only valid on the thread that initialized the scheduler.
 namespace HostContext {
 
 using Handle = void*;

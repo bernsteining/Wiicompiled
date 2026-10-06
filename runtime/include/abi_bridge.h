@@ -771,12 +771,31 @@ public:
         // measured clean and its registration opts out below.
         info.nonvolatileFprWriteMask = preservesNonvolatileFprs ? 0 : (nonvolatileFprWriteMask & kPpcAllNonvolatileFprMask);
         info.entryPoint = reinterpret_cast<void*>(target);
-        info.rawCpuInvoker = rawCpuInvoker ? rawCpuInvoker : reinterpret_cast<void (*)(CpuContext*)>(target);
+        // Never cast a value-returning target to void(CpuContext*): the call is undefined, and
+        // WebAssembly's call_indirect traps on the signature mismatch. Such a target needs a typed
+        // thunk passed as rawCpuInvoker (REGISTER_TRANSLATED_FUNCTION does this).
+        if constexpr (std::is_void_v<Ret>) {
+            info.rawCpuInvoker = rawCpuInvoker ? rawCpuInvoker : target;
+        } else {
+            info.rawCpuInvoker = rawCpuInvoker;
+        }
         info.mustRemainDynamicallyDispatchable = mustRemainDynamicallyDispatchable;
         info.kind = kind;
         TranslatedFunctionRegistry::Register(std::move(info));
     }
 };
+
+// The raw CPU entry for a registered function: the function itself when it already has that
+// signature, otherwise a typed thunk.
+template <auto Target>
+constexpr auto AbiRawCpuInvokerFor() -> void (*)(CpuContext*)
+{
+    if constexpr (std::is_same_v<decltype(Target), void (*)(CpuContext*)>) {
+        return Target;
+    } else {
+        return &AbiRawCpuThunk<Target>::Invoke;
+    }
+}
 
 #define MKW_DETAIL_CAT(a, b) a##b
 #define MKW_DETAIL_MAKE_UNIQUE(a, b) MKW_DETAIL_CAT(a, b)
@@ -785,7 +804,7 @@ public:
 // translated function reaches the registry via the bulk BulkTranslatedFunctionRecord tables
 // in the translator's *_registration TUs.
 #define REGISTER_TRANSLATED_FUNCTION(address, fn) \
-    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::BaseTranslated, false, kPpcAllNonvolatileFprMask, 0, 0, nullptr, KnownTranslatedCpuCall<address>::kMustRemainDynamicallyDispatchable)
+    static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::BaseTranslated, false, kPpcAllNonvolatileFprMask, 0, 0, AbiRawCpuInvokerFor<&fn>(), KnownTranslatedCpuCall<address>::kMustRemainDynamicallyDispatchable)
 
 #define REGISTER_NATIVE_FUNCTION(address, fn) \
     static AbiTrampoline<decltype(fn)> MKW_DETAIL_MAKE_UNIQUE(_abi_native_trampoline_, __COUNTER__)(address, #fn, fn, FunctionKind::Native, false, kPpcAllNonvolatileFprMask, 0, 0, &AbiRawCpuThunk<&fn>::Invoke)

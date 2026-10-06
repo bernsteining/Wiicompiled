@@ -12,6 +12,7 @@
 
 #include "abi_bridge.h"
 #include "memory.h"
+#include "platform/host_wait.h"
 #include "hle_stubs.h"
 #include "ppc_runtime.h"
 #include "recomp_mod_loader.h"
@@ -84,7 +85,7 @@ extern "C" void GKI_delay_HLE_801301b4(CpuContext* ctx)
 {
     const uint32_t delayMs = ctx ? static_cast<uint32_t>(ctx->gpr[3]) : 0;
     const uint32_t sleepMs = delayMs == 0 ? 1u : std::min(delayMs, 10u);
-    std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+    HostWait::SleepFor(std::chrono::milliseconds(sleepMs));
 }
 
 extern "C" uint32_t BTM_IsDeviceUp_HLE_8013a300(CpuContext* ctx)

@@ -76,6 +76,17 @@
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/em_js.h>
+#include "isa/ppc_isa_fma.h"
+
+// The page shows the message over the game (Module.mkwShowError in shell.html).
+EM_JS_DEPS(mkw_web_fatal, "$UTF8ToString");
+EM_JS(void, mkw_web_show_fatal, (const char* message), {
+    if (Module['mkwShowError']) Module['mkwShowError'](UTF8ToString(message));
+});
+#endif
+
 // Defined in `runtime/src/hle/vi.cpp` (used by GX/VI HLE).
 extern std::atomic_bool g_auroraFrameActive;
 extern "C" int g_gxFrameCount;
@@ -410,6 +421,13 @@ void InitializeProcessTranscript(int argc, char** argv) {
     if (state.initialized.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
+#if defined(__EMSCRIPTEN__)
+    // The browser console already records stdout/stderr, and the web build has no threads to pump
+    // transcript pipes with.
+    (void)argc;
+    (void)argv;
+    return;
+#endif
 
     const std::filesystem::path path = GetRunLogDirectory() / "console.log";
     state.file.open(path, std::ios::out | std::ios::trunc | std::ios::binary);
@@ -782,6 +800,9 @@ void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) 
 #if defined(_WIN32)
         ::MessageBoxA(nullptr, message.c_str(), "WiiCompiled - Fatal Error",
                       MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL);
+#elif defined(__EMSCRIPTEN__)
+        RT_LOGF(RT_TAG_RUNTIME, "fatal dialog: %s\n", message.c_str());
+        mkw_web_show_fatal(message.c_str());
 #else
         // The shipped product is Windows-first. Keep non-Windows builds safe
         // and retain the console diagnostic when no native dialog is available.
@@ -1335,6 +1356,14 @@ int RuntimeMain(int argc, char** argv) {
         if (argc != 1) {
             throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
         }
+#if defined(MKW_WASM_RELAXED_FMA)
+        // The engine may run relaxed madd unfused (it does on x86 CPUs without FMA3), which would
+        // quietly change physics results; see ppc_isa_fma.h.
+        if (!MkwHostFmaIsFused()) {
+            throw std::runtime_error("This processor does not fuse multiply-add, which this build needs for exact "
+                                     "physics. Use the build made with -DMKW_WEB_FMA=soft.");
+        }
+#endif
         RuntimeConfigFile::LogLoadedConfig();
         if (RuntimeConfigFile::DiscordPresenceEnabled()) {
             DiscordPresence::Initialize(RuntimeConfigFile::DiscordClientId(), "Mario Kart Wii");
@@ -1404,6 +1433,10 @@ int RuntimeMain(int argc, char** argv) {
 #elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
+        }};
+#elif defined(__EMSCRIPTEN__)
+        static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"webgpu", BACKEND_WEBGPU},
         }};
 
 #endif

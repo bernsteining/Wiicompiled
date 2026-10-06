@@ -1336,6 +1336,10 @@ private:
     }
 
     bool EnsureMixWorker() {
+#if defined(__EMSCRIPTEN__)
+        // The web build is single-threaded: command lists are mixed inline.
+        return false;
+#endif
         if (m_mixThread.joinable()) {
             return true;
         }

@@ -1,6 +1,7 @@
 #include "audio_backend.h"
 
 #include "runtime_log.h"
+#include "platform/web_perf.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -121,7 +122,11 @@ bool AudioBackend::QueueHasCapacityLocked(int incomingBytes) {
         return true;
     }
     const uint32_t maxQueued = QueueLimitBytesLocked();
+    if (queued == 0) {
+        MKW_WEB_PERF_COUNT(kAudioQueueEmpty, 1);
+    }
     if (static_cast<uint64_t>(queued) + static_cast<uint64_t>(std::max(incomingBytes, 0)) > maxQueued) {
+        MKW_WEB_PERF_COUNT(kAudioBlocksDropped, 1);
         // Match Dolphin's FIFO overflow behavior: preserve the continuous audio
         // already queued and discard the new block.  Clearing SDL's entire
         // stream creates an audible discontinuity (the severe crackle seen when

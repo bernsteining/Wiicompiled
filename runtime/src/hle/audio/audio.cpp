@@ -1,3 +1,6 @@
+#if defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#endif
 #include "memory.h"
 #include "guest_interrupt_context.h"
 #include "hle_stubs.h"
@@ -351,8 +354,19 @@ PPC_NATIVE_OVERRIDE(8015D57C, DSPAssertTask_8015d57c, uint32_t, (uint32_t taskPt
 
 // Each delivered block runs the AI DMA callback and deferred AX task callbacks before the
 // next block, preserving the SoundThread/DSP interleave order real hardware provides.
+#if defined(__EMSCRIPTEN__)
+// The page's performance report (aurora-main/lib/web_perf.hpp, bucket 2).
+extern "C" void aurora_web_perf_add(int bucket, double milliseconds);
+#endif
+
 void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
 {
+#if defined(__EMSCRIPTEN__)
+    struct PerfScope {
+        double started = emscripten_get_now();
+        ~PerfScope() { aurora_web_perf_add(2, emscripten_get_now() - started); }
+    } perfScope;
+#endif
     uint32_t startAddr = 0;
     uint32_t length = 0;
     uint32_t callback = 0;

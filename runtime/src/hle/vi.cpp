@@ -7,6 +7,8 @@
 #include "settings_overlay.h"
 #include "fiber_manager.h"
 #include "platform/host_platform.h"
+#include "platform/host_wait.h"
+#include "platform/web_perf.h"
 #include "runtime_log.h"
 
 #include <dolphin/vi.h>
@@ -165,6 +167,14 @@ void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false
     if (now >= deadline) {
         return;
     }
+#if defined(__EMSCRIPTEN__)
+    // The browser's main thread must not block or spin: suspend until the deadline. Browser
+    // timers are millisecond-grained, so the spin window cannot buy precision here anyway.
+    (void)finishWithSpin;
+    (void)spinWindow;
+    HostWait::SleepUntil(deadline);
+    return;
+#endif
     const auto timerDeadline =
         finishWithSpin && deadline - now > spinWindow ? deadline - spinWindow : deadline;
 #if defined(_WIN32)
@@ -377,6 +387,37 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     s_inAdvanceRetrace.store(false);
 }
 
+#if defined(__EMSCRIPTEN__)
+// In a browser the frame is shown on the display's refresh, and aurora waits for one
+// (requestAnimationFrame) after each frame. With the retrace on its own wall-clock grid the game
+// waits for both clocks every frame. Whenever their phases drift apart, a frame that fits in one
+// refresh misses it: 36-46 instead of 60 fps, measured in Chrome on a race. So when the display
+// refreshes at about the retrace rate, each refresh is the retrace: the idle loop waits for it and
+// delivers it, and aurora skips its own wait because a refresh has just passed. Other rates
+// (120/144 Hz displays, PAL50), a hidden page and long stalls keep the wall-clock grid, so the game
+// keeps its speed there.
+double s_lastRetraceTick = -1.0;
+bool s_displayPacesRetrace = false;
+
+// The current refresh count while the display paces the retrace, otherwise -1.
+double DisplayPacingTick() {
+    const double tick = mkw_web_display_tick();
+    const double displayMs = mkw_web_display_period_ms();
+    double retraceMs = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(g_viMutex);
+        retraceMs = std::chrono::duration<double, std::milli>(g_vi.retraceInterval).count();
+    }
+    const bool paces = tick >= 0.0 && displayMs >= 0.9 * retraceMs && displayMs <= 1.1 * retraceMs;
+    if (paces != s_displayPacesRetrace) {
+        s_displayPacesRetrace = paces;
+        s_lastRetraceTick = tick;
+        mkw_web_set_display_locked(paces ? 1 : 0);
+    }
+    return paces ? tick : -1.0;
+}
+#endif
+
 bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
 {
     bool advancedAny = false;
@@ -384,6 +425,21 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
     for (int catchUpCount = 0; catchUpCount < maxToProcess; ++catchUpCount) {
         Clock::time_point target;
         auto now = Clock::now();
+#if defined(__EMSCRIPTEN__)
+        if (const double tick = DisplayPacingTick(); tick >= 0.0) {
+            // One retrace per refresh, stamped now.
+            if (tick == s_lastRetraceTick) {
+                return advancedAny;
+            }
+            std::lock_guard<std::mutex> lock(g_viMutex);
+            if (!g_vi.initialized) {
+                return advancedAny;
+            }
+            s_lastRetraceTick = tick;
+            target = now;
+            MKW_WEB_PERF_COUNT(kRetracesByDisplay, 1);
+        } else
+#endif
         {
             std::lock_guard<std::mutex> lock(g_viMutex);
             if (!g_vi.initialized) {
@@ -393,6 +449,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
             if (now < target) {
                 return advancedAny;
             }
+            MKW_WEB_PERF_COUNT(kRetracesByClock, 1);
         }
 
 
@@ -454,6 +511,16 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess) {
 }
 
 void VI_HLE_WaitForNextRetracePoll() {
+#if defined(__EMSCRIPTEN__)
+    if (const double tick = DisplayPacingTick(); tick >= 0.0) {
+        // The next retrace is the next refresh (DisplayPacingTick). Wait at most 4 ms for it: the
+        // caller services alarms and audio DMA between waits.
+        if (tick == s_lastRetraceTick) {
+            mkw_web_wait_display_tick(4.0);
+        }
+        return;
+    }
+#endif
     Clock::time_point retraceDeadline;
     {
         std::lock_guard<std::mutex> lock(g_viMutex);
@@ -488,6 +555,18 @@ uint64_t s_lastPresentAnchorNanos = 0;
 // Sleeps to the same VI retrace boundary VIWaitForRetrace targets, servicing alarms every 1 ms so audio
 // DMA and timers keep running, then delivers that retrace so guest logic starts exactly on the grid.
 void PaceToRetraceBoundary(Clock::time_point deadline) {
+#if defined(__EMSCRIPTEN__)
+    // While the display paces the retrace (DisplayPacingTick), the boundary is the next refresh.
+    for (double tick = DisplayPacingTick(); tick >= 0.0; tick = DisplayPacingTick()) {
+        if (tick != s_lastRetraceTick) {
+            VI_HLE_ProcessRetracesDeferred(1);
+            return;
+        }
+        mkw_web_wait_display_tick(4.0);
+        OS_HLE_ProcessAlarmsDeferred(8);
+        Audio_HLE_PollDeferred();
+    }
+#endif
     constexpr auto kServiceSlice = 1ms;
     for (;;) {
         const auto now = Clock::now();

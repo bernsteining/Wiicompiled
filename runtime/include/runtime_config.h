@@ -20,6 +20,7 @@
 #include <vector>
 #include <toml.hpp>
 #include "platform/host_platform.h"
+#include "platform/web_mounts.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -175,6 +176,9 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
     static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
 #elif defined(_WIN32)
     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+#elif defined(__EMSCRIPTEN__)
+    // The browser's WebGPU is the only backend.
+    static constexpr std::array<std::string_view, 2> values{"auto", "webgpu"};
 #endif
     return std::find(values.begin(), values.end(), value) != values.end();
 }
@@ -189,7 +193,12 @@ inline bool IsSupportedDisplayMode(std::string_view value) {
 // 240 was offered by an early build and is no longer supported; a saved 240 is
 // migrated to 180 at the parse site.
 inline bool IsSupportedFrameInterpolationFps(uint32_t value) {
+#if defined(__EMSCRIPTEN__)
+    // The browser presents at its own refresh; there is no presenter to pace interpolated slots.
+    return value == 0;
+#else
     return value == 0 || value == 120 || value == 180;
+#endif
 }
 
 inline std::optional<std::filesystem::path> ExecutableDirectory() {
@@ -206,7 +215,7 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
         }
         buffer.resize(buffer.size() * 2);
     }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__EMSCRIPTEN__)
     return RuntimePlatform::ExecutableDirectory();
 #else
     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
@@ -265,7 +274,7 @@ inline std::filesystem::path ApplicationDataDirectory() {
         CoTaskMemFree(rawPath);
         return directory;
     }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__EMSCRIPTEN__)
     return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
 #else
     // XDG Base Directory spec equivalent of FOLDERID_LocalAppData: $XDG_DATA_HOME if set and
@@ -990,6 +999,12 @@ inline std::filesystem::path ResolveRelativeToConfig(const std::string& value) {
 // The extracted DATA directory. Empty when nothing is configured.
 inline std::filesystem::path ResolvedDvdRoot() {
     const std::string configured = DvdRoot();
+#if defined(__EMSCRIPTEN__)
+    // The page mounts the DATA directory the user picked here.
+    if (configured.empty()) {
+        return std::filesystem::path(WebMounts::kDisc);
+    }
+#endif
     return configured.empty() ? std::filesystem::path{} : ResolveRelativeToConfig(configured);
 }
 

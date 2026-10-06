@@ -10,6 +10,8 @@
 #include <mbedtls/ssl.h>
 #include <mbedtls/x509_crt.h>
 
+#include <sys/time.h>  // struct timeval for SO_RCVTIMEO; glibc only provides it transitively
+
 #include <chrono>
 #include <cstring>
 #include <filesystem>

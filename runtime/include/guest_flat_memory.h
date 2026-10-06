@@ -36,11 +36,26 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0080'0000'0000ull;
 // probing to sit far below where the PIE image, heap, shared libraries and
 // stack actually land (all clustered above ~340 GiB on a 39-bit/512 GiB system).
 inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
+#elif defined(__wasm__)
+// WebAssembly has no fixed-address reservation, page protection or fault handler, and wasm32's
+// whole address space is 4 GiB. Guest memory lives in ordinary allocations
+// (runtime/web/guest_flat_memory_wasm.cpp) and every access takes the checked page-table path, so there is no
+// flat view at all; see kHasFlatView.
 #else
 #error "guest_flat_memory.h has no fixed flat guest base chosen for this architecture"
 #endif
 
+#if defined(__wasm__)
+inline constexpr bool kHasFlatView = false;
+// Every flat-view access is behind RequiresCheckedAccess() (constant true here) or
+// kHasFlatView, so this is unreachable; it traps instead of letting a stray use write through a
+// null base into the runtime's own memory.
+[[noreturn]] inline uint8_t* UnavailableFlatGuestBase() noexcept { __builtin_trap(); }
+#define MKW_FLAT_GUEST_BASE (::GuestFlat::UnavailableFlatGuestBase())
+#else
+inline constexpr bool kHasFlatView = true;
 #define MKW_FLAT_GUEST_BASE (reinterpret_cast<uint8_t*>(GuestFlat::kFixedFlatGuestBase))
+#endif
 
 enum class Backing {
     Owned,
@@ -77,7 +92,9 @@ bool IsActive();
 #define MKW_GUEST_FLAT_FIXED_PAGE_SIZE 1
 #endif
 
-#if defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
+#if defined(__wasm__)
+inline constexpr bool RequiresCheckedAccess() noexcept { return true; }
+#elif defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
 inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
 #else
 extern bool g_requiresCheckedAccess;
