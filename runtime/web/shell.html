@@ -68,7 +68,18 @@
       mkwLog(`lowres: devicePixelRatio ${window.devicePixelRatio}`);
     }
     addEventListener('error', (e) => mkwLog(`error: ${e.message} (${e.filename}:${e.lineno})`));
-    addEventListener('unhandledrejection', (e) => mkwLog(`unhandled rejection: ${(e.reason && e.reason.stack) || e.reason}`));
+    // Safari's stacks leave out the message ("createBindGroup@[native code]"), so log both.
+    addEventListener('unhandledrejection', (e) => mkwLog(`unhandled rejection: ${e.reason}\n${(e.reason && e.reason.stack) || ''}`));
+    // Say when the GPU device is lost (in Safari, its GPU process crashed or was killed), as it happens:
+    // the game's own report of it comes a frame later, if the next WebGPU call does not throw first.
+    if (navigator.gpu && typeof GPUAdapter === 'function') {
+      const requestDevice = GPUAdapter.prototype.requestDevice;
+      GPUAdapter.prototype.requestDevice = async function (...args) {
+        const device = await requestDevice.apply(this, args);
+        device.lost.then((info) => mkwLog(`webgpu device lost: ${info.reason} ${info.message}`));
+        return device;
+      };
+    }
 
     // The game needs WebGPU, which browsers only offer on https:// or localhost, and JSPI. Name
     // what is missing up front instead of failing later with an obscure error.
@@ -159,13 +170,13 @@
     // (platform/web_perf.h). With ?log a summary goes to the server every 5 s, and every frame
     // over 50 ms gets a "hitch" line saying what that frame did.
     var mkwPerf = { frames: 0, frame: 0, yield: 0, sleep: 0, disc: 0, switches: 0, switchCost: 0,
-                    discReads: 0, discBytes: 0, discWorst: 0, heap: 0,
+                    discReads: 0, discBytes: 0, discWorst: 0, heap: 0, gpuWorst: 0,
                     cpu: [0, 0, 0], // CPU ms: GX decode, frame encode, audio tick
                     counts: new Float64Array(64) };
     // counts[] index -> name; aurora's from 0, the runtime's from 32.
     var mkwPerfCounters = { pipelinesStarted: 0, pipelinesFinished: 1, pipelineAsyncMs: 2, pipelinesNow: 3,
                             pipelineNowMs: 4, drawsSkipped: 5, draws: 6, uploadBytes: 7, textureUploads: 8,
-                            textureBytes: 9, batches: 10, audioDropped: 32, audioEmpty: 33,
+                            textureBytes: 9, batches: 10, gpuFrames: 11, gpuMs: 12, audioDropped: 32, audioEmpty: 33,
                             retracesDisplay: 34, retracesClock: 35 };
     var mkwPerfFrame; // set below with ?log; aurora calls it as Module.mkwPerfFrame
     if (new URLSearchParams(location.search).has('log')) {
@@ -272,13 +283,16 @@
           `(${frames ? kb(n(c.textureBytes) / frames) : '-'} KB), batches ${perFrame(n(c.batches), 2)}; ` +
           `pipelines: started ${n(c.pipelinesStarted)}, finished ${finished}` +
           (finished ? ` (avg ${(n(c.pipelineAsyncMs) / finished).toFixed(0)} ms)` : '') +
-          `, compiled now ${n(c.pipelinesNow)} (${n(c.pipelineNowMs).toFixed(0)} ms), compiling ${inFlight}`);
+          `, compiled now ${n(c.pipelinesNow)} (${n(c.pipelineNowMs).toFixed(0)} ms), compiling ${inFlight}; ` +
+          `gpu submit to done ${n(c.gpuFrames) ? (n(c.gpuMs) / n(c.gpuFrames)).toFixed(1) : '-'} ms avg, ` +
+          `worst ${perf.gpuWorst.toFixed(1)} ms`);
         mkwLog(`perf disc: ${d('discReads')} reads, ${mb(d('discBytes'))} MB, worst ${perf.discWorst.toFixed(0)} ms; ` +
           `audio: dropped ${n(c.audioDropped)}, ran dry ${n(c.audioEmpty)}` +
           (Module.SDL3?.audioContext ? ` (output ${Module.SDL3.audioContext.state}, ${Module.SDL3.audioContext.sampleRate} Hz)` : ' (no output yet)') +
           `; memory: wasm ${mb(perf.heap)} MB` +
           (performance.memory ? `, js heap and buffers ${mb(performance.memory.usedJSHeapSize)} MB` : ''));
         perf.discWorst = 0;
+        perf.gpuWorst = 0;
         window5 = { worstRefresh: 0, lateRefreshes: 0, worstFrame: 0, over20: 0, over33: 0, over50: 0,
                     hitches: 0, longTasks: 0, longTaskMs: 0 };
         last = snapshot();

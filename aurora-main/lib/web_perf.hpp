@@ -37,7 +37,13 @@ enum Counter : int {
   kTextureUploads = 8,
   kTextureBytes = 9,
   kBatches = 10,          // staging batches submitted (more than one a frame: capacity splits, EFB copies)
+  kGpuFrames = 11,        // frames whose GPU work reported done
+  kGpuMs = 12,            // their scene's submit-to-done time, summed (an upper bound on its GPU time)
 };
+
+// A frame's scene was submitted at `submitted` (emscripten_get_now()) and the GPU reported it done
+// `milliseconds` later: adds to kGpuFrames and kGpuMs and tracks the worst (Module.mkwPerf.gpuWorst).
+extern "C" void aurora_web_perf_gpu_done(double milliseconds);
 
 inline void count(Counter counter, double amount = 1.0) { aurora_web_perf_count(counter, amount); }
 

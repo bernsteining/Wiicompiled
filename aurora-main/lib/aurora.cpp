@@ -79,6 +79,13 @@ EM_JS(void, aurora_web_perf_count, (int counter, double amount), {
   const perf = Module['mkwPerf'];
   if (perf && perf.counts) perf.counts[counter] += amount;
 });
+EM_JS(void, aurora_web_perf_gpu_done, (double milliseconds), {
+  const perf = Module['mkwPerf'];
+  if (!perf || !perf.counts) return;
+  perf.counts[11] += 1;
+  perf.counts[12] += milliseconds;
+  perf.gpuWorst = Math.max(perf.gpuWorst || 0, milliseconds);
+});
 
 // Suspends (through JSPI) until the browser's next animation frame: the canvas texture rendered
 // this frame is shown when control returns to the event loop, and input, audio and timer callbacks
@@ -1666,6 +1673,17 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
     const auto buffer = target.Finish(&cmdBufDescriptor);
     std::lock_guard submitLock(g_queueSubmitMutex);
     g_queue.Submit(1, &buffer);
+#ifdef AURORA_WEBGPU_BROWSER
+    // How long the GPU takes over the scene, for the page's report. The callback runs from the
+    // browser's event loop, so a frame whose work finishes while the game still runs reads late:
+    // an upper bound, and a fair comparison between shader paths on one device.
+    g_queue.OnSubmittedWorkDone(wgpu::CallbackMode::AllowSpontaneous,
+                                [submitted = emscripten_get_now()](wgpu::QueueWorkDoneStatus status, wgpu::StringView) {
+                                  if (status == wgpu::QueueWorkDoneStatus::Success) {
+                                    aurora_web_perf_gpu_done(emscripten_get_now() - submitted);
+                                  }
+                                });
+#endif
     if (releaseMetalFXOutput && g_metalfxPendingOutput) {
       if (!g_metalfxPendingOutput->end_output()) metalfx_failed(g_metalfxPendingOutput->error());
       g_metalfxPendingOutput = nullptr;
