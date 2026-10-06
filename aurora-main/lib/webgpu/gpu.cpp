@@ -500,6 +500,15 @@ static bool create_surface() {
     Log.error("Failed to create surface: no window");
     return false;
   }
+#ifdef AURORA_WEBGPU_BROWSER
+  // SDL's Emscripten video driver renders into this canvas (SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR).
+  wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasSource{};
+  canvasSource.selector = "#canvas";
+  const wgpu::SurfaceDescriptor surfaceDescriptor{
+      .nextInChain = &canvasSource,
+      .label = "Surface",
+  };
+#else
   const auto chainedDescriptor = utils::SetupWindowAndGetSurfaceDescriptor(window);
   if (!chainedDescriptor) {
     Log.error("Failed to create surface descriptor for current window");
@@ -509,6 +518,7 @@ static bool create_surface() {
       .nextInChain = chainedDescriptor.get(),
       .label = "Surface",
   };
+#endif
   release_surface();
   g_surface = g_instance.CreateSurface(&surfaceDescriptor);
   if (!g_surface) {
@@ -560,7 +570,12 @@ bool initialize(AuroraBackend auroraBackend) {
   {
     const wgpu::RequestAdapterOptions options{
         .powerPreference = wgpu::PowerPreference::HighPerformance,
+#ifdef AURORA_WEBGPU_BROWSER
+        // The browser chooses its own native API.
+        .backendType = wgpu::BackendType::Undefined,
+#else
         .backendType = backend,
+#endif
         .compatibleSurface = g_surface,
     };
     const auto future = g_instance.RequestAdapter(
@@ -642,6 +657,7 @@ bool initialize(AuroraBackend auroraBackend) {
         requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
         requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
+#ifdef WEBGPU_DAWN
     // Optional native sharing for MetalFX. Devices without either feature keep
     // the normal renderer; the upscaler checks the enabled pair at runtime.
     if (backend == wgpu::BackendType::Metal &&
@@ -650,6 +666,7 @@ bool initialize(AuroraBackend auroraBackend) {
       requiredFeatures.push_back(wgpu::FeatureName::SharedTextureMemoryIOSurface);
       requiredFeatures.push_back(wgpu::FeatureName::SharedFenceMTLSharedEvent);
     }
+#endif
     bool implicitDeviceSynchronizationSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
@@ -659,13 +676,20 @@ bool initialize(AuroraBackend auroraBackend) {
         g_bcTexturesSupported = true;
         requiredFeatures.push_back(feature);
       }
+#ifdef WEBGPU_DAWN
       // The presenter calls device and queue methods while the frame worker encodes, which Dawn only
       // supports with this feature; without it the two race inside the device's dynamic uploader.
       if (feature == wgpu::FeatureName::ImplicitDeviceSynchronization) {
         implicitDeviceSynchronizationSupported = true;
         requiredFeatures.push_back(feature);
       }
+#endif
     }
+#ifdef AURORA_WEBGPU_BROWSER
+    // A browser device belongs to one JavaScript thread, and the web build renders and presents
+    // on that thread only (no frame worker or presenter), so device synchronization is moot.
+    implicitDeviceSynchronizationSupported = true;
+#endif
     if (!implicitDeviceSynchronizationSupported) {
       Log.warn(
           "Adapter does not support ImplicitDeviceSynchronization; multi-threaded presentation is "
@@ -716,6 +740,20 @@ bool initialize(AuroraBackend auroraBackend) {
     deviceDescriptor.requiredLimits = &requiredLimits;
     deviceDescriptor.SetUncapturedErrorCallback(
         [](const wgpu::Device& device, wgpu::ErrorType type, wgpu::StringView message) {
+#ifdef AURORA_WEBGPU_BROWSER
+          // A browser validates every call (native Dawn runs with validation skipped), and WebKit
+          // reports an invalid command only through a later one ("encoder state is not valid" on
+          // the next pass, the cause at finish()). Log validation errors and keep going: the browser
+          // drops the affected command buffer, which usually costs one frame or one effect.
+          if (type == wgpu::ErrorType::Validation) {
+            static int s_loggedValidationErrors = 0;
+            if (s_loggedValidationErrors < 32) {
+              ++s_loggedValidationErrors;
+              Log.error("WebGPU validation error: {}", message);
+            }
+            return;
+          }
+#endif
           if (g_initialized.load(std::memory_order_acquire)) {
             FATAL("WebGPU error {}: {}", underlying(type), message);
           } else {
@@ -764,6 +802,7 @@ bool initialize(AuroraBackend auroraBackend) {
     if (!g_device) {
       return false;
     }
+#ifdef WEBGPU_DAWN
     g_device.SetLoggingCallback([](wgpu::LoggingType type, wgpu::StringView message) {
       AuroraLogLevel level = LOG_FATAL;
       switch (type) {
@@ -784,6 +823,7 @@ bool initialize(AuroraBackend auroraBackend) {
       }
       Log.report(level, "WebGPU message: {}", message);
     });
+#endif
   }
   g_queue = g_device.GetQueue();
 

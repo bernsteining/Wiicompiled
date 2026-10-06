@@ -90,7 +90,12 @@ private:
   static constexpr size_t kChunk = 16;
 
   InterpolationWorkerPool() {
+#ifdef __EMSCRIPTEN__
+    // The web build is single-threaded; the caller does all the work.
+    const unsigned hardware = 1;
+#else
     const unsigned hardware = std::thread::hardware_concurrency();
+#endif
     // The caller helps too. Cap the helpers: tasks are short memcpy+math, so dispatch
     // overhead and memory bandwidth dominate past a few threads.
     const unsigned helpers = hardware > 2 ? std::min(hardware - 1, 6u) : 0;

@@ -44,6 +44,79 @@
 #include <thread>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
+#include "web_perf.hpp"
+#include <emscripten/em_js.h>
+#include <emscripten/emscripten.h>
+
+// When the page last returned to the browser; update() yields itself if that was too long ago.
+static double g_webLastYieldMs = 0.0;
+
+// One turn of the browser's event loop without waiting for the display: a MessageChannel task,
+// which (unlike setTimeout) is not clamped to 4 ms when chained.
+EM_ASYNC_JS(void, aurora_web_yield_to_browser, (), {
+  if (!Module['auroraYieldChannel']) {
+    // One channel for every yield: a new one per call is garbage the collector has to chase.
+    const channel = new MessageChannel();
+    const waiting = [];
+    channel.port1.onmessage = () => waiting.shift()();
+    Module['auroraYieldChannel'] = (resolve) => {
+      waiting.push(resolve);
+      channel.port2.postMessage(0);
+    };
+  }
+  const started = performance.now();
+  await new Promise((resolve) => Module['auroraYieldChannel'](resolve));
+  if (Module['mkwPerf']) Module['mkwPerf'].yield += performance.now() - started;
+});
+
+// CPU time per bucket and event counts for the page's performance report (lib/web_perf.hpp).
+EM_JS(void, aurora_web_perf_add, (int bucket, double milliseconds), {
+  const perf = Module['mkwPerf'];
+  if (perf && perf.cpu) perf.cpu[bucket] += milliseconds;
+});
+EM_JS(void, aurora_web_perf_count, (int counter, double amount), {
+  const perf = Module['mkwPerf'];
+  if (perf && perf.counts) perf.counts[counter] += amount;
+});
+
+// Suspends (through JSPI) until the browser's next animation frame: the canvas texture rendered
+// this frame is shown when control returns to the event loop, and input, audio and timer callbacks
+// run there. Hidden tabs get no animation frames, so they fall back to a timer. Always waiting for
+// the animation frame matters: returning early when the game runs late (a timer or MessageChannel
+// turn instead) starved Chrome's own rendering and dropped the game from 60 to ~2 FPS.
+// One exception: Module.mkwDisplay is the embedder's refresh ticker (WiiCompiled's
+// runtime/web/host_wait_web.cpp). While its `locked` flag is set, the embedder already waits for
+// each refresh before the frame (its VI retrace is the refresh), so when a refresh has passed since
+// the previous frame this one is presented without a second wait.
+EM_ASYNC_JS(void, aurora_web_wait_for_browser_frame, (), {
+  const perf = Module['mkwPerf'];
+  const display = Module['mkwDisplay'];
+  if (display && display.locked && display.count !== Module['auroraPresentedTick']) {
+    Module['auroraPresentedTick'] = display.count;
+    if (perf) perf.frames++;
+    Module['mkwPerfFrame']?.(HEAP8.length);
+    return;
+  }
+  const started = performance.now();
+  await new Promise((resolve) => {
+    if (typeof document !== 'undefined' && document.hidden) {
+      setTimeout(resolve, 16);
+    } else if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => resolve());
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+  if (display) Module['auroraPresentedTick'] = display.count;
+  if (perf) {
+    perf.frames++;
+    perf.frame += performance.now() - started;
+  }
+  Module['mkwPerfFrame']?.(HEAP8.length);
+});
+#endif
+
 #ifdef AURORA_ENABLE_GX
 namespace aurora::gx {
 // Producer pacing feedback for the adaptive slot count, defined in lib/gx/shader_info.cpp;
@@ -259,6 +332,11 @@ FrameWorkerState g_frameWorker;
 bool frame_worker_requested() noexcept {
 #ifdef AURORA_ENABLE_GX
   static const bool enabled = [] {
+#if defined(__EMSCRIPTEN__)
+    // A browser WebGPU device belongs to one JavaScript thread, so the web build encodes,
+    // submits and presents on the calling thread (and is not built with threads at all).
+    return false;
+#endif
 #if defined(__APPLE__)
     // ImGui's SDL backend may raise an SDL window from ImGui::NewFrame(). On
     // macOS that reaches AppKit, whose window operations are main-thread-only;
@@ -992,12 +1070,16 @@ bool present_presentation_job(const PresentationJob& job) {
             PresentClock::now() - submitStarted);
         // Pace the Present() call itself, not the whole unit, so acquire/encode/submit variance stays out
         // of the cadence. Holding the image across the wait is safe while the surface lock is held.
+        // The browser presents at its own refresh after end_frame yields, so the web build never
+        // blocks here.
+#ifndef __EMSCRIPTEN__
         if (job.presentAt != PresentClock::time_point{}) {
           const auto scheduleWaitStarted = PresentClock::now();
           wait_until_precise(job.presentAt);
           scheduleWaitDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
               PresentClock::now() - scheduleWaitStarted);
         }
+#endif
         // A native resize can arrive after acquisition, so drop the obsolete image and let the render
         // worker reconfigure at its ordered frame boundary.
         if (!g_surfaceReconfigurePending.load(std::memory_order_acquire) &&
@@ -1009,7 +1091,13 @@ bool present_presentation_job(const PresentationJob& job) {
           wgpu::Status presentStatus;
           {
             std::lock_guard submitLock(g_queueSubmitMutex);
+#ifdef __EMSCRIPTEN__
+            // The canvas texture is shown when the page next yields to the browser
+            // (aurora_web_wait_for_browser_frame at the end of the frame); there is no Present().
+            presentStatus = wgpu::Status::Success;
+#else
             presentStatus = g_surface.Present();
+#endif
           }
           presentDuration = std::chrono::duration_cast<std::chrono::nanoseconds>(
               PresentClock::now() - presentStarted);
@@ -1385,6 +1473,17 @@ void shutdown() noexcept {
 
 const AuroraEvent* update() noexcept {
   ZoneScoped;
+#ifdef __EMSCRIPTEN__
+  // A loop that never reaches end_frame (paused window, begin_frame failing until the canvas has a
+  // size) would otherwise spin without returning to the browser, which then never delivers the
+  // events that end the condition. Every application loop calls update(), so give the browser a
+  // turn here when it has not had one for a while. Not an animation-frame wait: the runtime calls
+  // update() on every VI retrace, and pacing is end_frame's job.
+  if (emscripten_get_now() - g_webLastYieldMs > 8.0) {
+    aurora_web_yield_to_browser();
+    g_webLastYieldMs = emscripten_get_now();
+  }
+#endif
   if (g_initialFrame) {
     g_initialFrame = false;
     input::initialize();
@@ -1679,11 +1778,11 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
 
 // Phase 3: hand the encoded group to whoever owns presentation.
 void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
   (void)interpolationActive;
   // Presenting reaches SDL/AppKit, whose window operations must stay on the
   // main thread. Interpolation normally starts the presenter worker, so keep
-  // its jobs synchronous on Apple platforms.
+  // its jobs synchronous on Apple platforms. The web build has a single thread.
   for (const auto& job : presentationJobs) {
     present_presentation_job(job);
   }
@@ -1815,7 +1914,7 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame) noexcept {
 #endif
 
 // Synchronous frame submission: seal, encode and present inline on the calling thread. Used when
-// the frame worker is disabled (RenderDoc captures) and on the boot path.
+// the frame worker is disabled (RenderDoc captures, Apple, the web) and on the boot path.
 void end_frame_impl(bool pumpEvents, bool drainFifo) {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -1827,6 +1926,9 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
   SealedFrameContext ctx;
   std::vector<PresentationJob> presentationJobs;
   if (drainFifo) gx::fifo::drain();
+#ifdef AURORA_WEBGPU_BROWSER
+  const double encodeStarted = emscripten_get_now();
+#endif
   {
     std::lock_guard gpuLock(g_rendererGpuMutex);
     seal_frame_locked(sealedFrame, ctx);
@@ -1834,6 +1936,11 @@ void end_frame_impl(bool pumpEvents, bool drainFifo) {
   }
   publish_presentations(std::move(presentationJobs), ctx.interpolationActive);
   record_frame_telemetry();
+#ifdef __EMSCRIPTEN__
+  aurora_web_perf_add(web_perf::kEncode, emscripten_get_now() - encodeStarted);
+  aurora_web_wait_for_browser_frame();
+  g_webLastYieldMs = emscripten_get_now();
+#endif
 #else
   (void)pumpEvents;
   (void)drainFifo;

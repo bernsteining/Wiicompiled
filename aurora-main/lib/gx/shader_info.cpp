@@ -565,6 +565,19 @@ static Mat4x4<float> effective_projection() noexcept {
   for (size_t i = 0; i < 4; ++i) {
     proj.m2.m[i] = flip ? -proj.m2.m[i] : (proj.m2.m[i] + proj.m3.m[i]);
   }
+#ifdef AURORA_WEBGPU_BROWSER
+  // The browser build clamps a viewport reaching outside the render target; map clip space so the
+  // geometry still lands where the full viewport would put it (gfx::browser_viewport_clamp).
+  const auto [targetWidth, targetHeight] = gfx::get_render_target_size();
+  const auto clamp =
+      gfx::browser_viewport_clamp(vp, static_cast<float>(targetWidth), static_cast<float>(targetHeight));
+  if (clamp.active) {
+    for (size_t i = 0; i < 4; ++i) {
+      proj.m0.m[i] = clamp.scaleX * proj.m0.m[i] + clamp.offsetX * proj.m3.m[i];
+      proj.m1.m[i] = clamp.scaleY * proj.m1.m[i] + clamp.offsetY * proj.m3.m[i];
+    }
+  }
+#endif
   return proj;
 }
 } // namespace

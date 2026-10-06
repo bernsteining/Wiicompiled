@@ -41,6 +41,11 @@ endfunction()
 
 # ── Auto: resolve provider based on platform availability ──
 set(_aurora_dawn_provider "${AURORA_DAWN_PROVIDER}")
+if (EMSCRIPTEN)
+  # The browser provides WebGPU; Emscripten's emdawnwebgpu port supplies the same webgpu.h and
+  # webgpu_cpp.h API Dawn does. There is no Dawn native code (no backends, toggles or Tint).
+  set(_aurora_dawn_provider "emscripten")
+endif ()
 if (_aurora_dawn_provider STREQUAL "auto")
   # Prebuilt Dawn packages available for: windows-{amd64,arm64}, linux-{x86_64,aarch64}, darwin-{arm64,x86_64}
   set(_has_package FALSE)
@@ -68,7 +73,20 @@ if (_aurora_dawn_provider STREQUAL "auto")
   message(STATUS "aurora: Dawn auto-resolved provider: ${_aurora_dawn_provider}")
 endif ()
 
-if (_aurora_dawn_provider STREQUAL "vendor")
+if (_aurora_dawn_provider STREQUAL "emscripten")
+  if (NOT TARGET dawn::webgpu_dawn)
+    add_library(aurora_emdawnwebgpu INTERFACE)
+    target_compile_options(aurora_emdawnwebgpu INTERFACE --use-port=emdawnwebgpu)
+    target_link_options(aurora_emdawnwebgpu INTERFACE --use-port=emdawnwebgpu)
+    add_library(dawn::webgpu_dawn ALIAS aurora_emdawnwebgpu)
+    add_library(dawn::dawncpp_headers ALIAS aurora_emdawnwebgpu)
+  endif ()
+  foreach (_backend D3D12 D3D11 VULKAN METAL DESKTOP_GL OPENGLES NULL)
+    set(DAWN_ENABLE_${_backend} OFF CACHE INTERNAL "")
+  endforeach ()
+  set(AURORA_DAWN_IS_SHARED FALSE PARENT_SCOPE)
+
+elseif (_aurora_dawn_provider STREQUAL "vendor")
   # ── Vendor: FetchContent build from source ──
   if (NOT TARGET webgpu_dawn)
     message(STATUS "aurora: Fetching Dawn (provider=vendor, linkage=${AURORA_DAWN_LINKAGE})")

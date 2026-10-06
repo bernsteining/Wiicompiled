@@ -1,6 +1,9 @@
 #include "clear.hpp"
 
 #include "../webgpu/gpu.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "pipeline_cache.hpp"
+#endif
 #include "tracy/Tracy.hpp"
 
 #include <algorithm>
@@ -130,7 +133,11 @@ fn fs_main() -> FragmentOutput {
           },
       .fragment = &fragmentState,
   };
+#ifdef AURORA_WEBGPU_BROWSER
+  return create_render_pipeline(pipelineDescriptor);
+#else
   return g_device.CreateRenderPipeline(&pipelineDescriptor);
+#endif
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize,

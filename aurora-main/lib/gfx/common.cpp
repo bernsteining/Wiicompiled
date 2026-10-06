@@ -1,4 +1,8 @@
 #include "common.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../web_perf.hpp"
+#include "../webgpu/browser_checks.hpp"
+#endif
 #include "staging_map.hpp"
 #include "../gx/shader_info.hpp"
 
@@ -132,6 +136,18 @@ constexpr size_t FrameSlotCount = 3;
 static std::array<wgpu::Buffer, FrameSlotCount> g_stagingBuffers;
 static size_t currentStagingBuffer = 0;
 static StagingMapState s_mappingState;
+#ifdef AURORA_WEBGPU_BROWSER
+// The browser build has no staging buffers: a frame's data is written into this block of wasm
+// memory and uploaded with queue.WriteBuffer, which copies only the bytes the frame used. A mapped
+// buffer is far more expensive there. emdawnwebgpu cannot expose the mapped memory to wasm, so
+// GetMappedRange allocates a heap copy of each range and Unmap copies every range back (37 MiB
+// per frame however little was written). Every map is also a round trip to the GPU process, and
+// the detached ArrayBuffers keep the garbage collector busy. Measured on a race in Chrome: a third
+// of the main thread went to garbage collection.
+// s_mappingState stays in use, completed immediately, and currentStagingBuffer still rotates
+// because it numbers the frame slots.
+static std::unique_ptr<uint8_t[]> g_browserStaging;
+#endif
 static wgpu::Limits g_cachedLimits;
 // Advanced once per logical frame in the seal prologue, under the renderer GPU mutex and with the
 // producer blocked, so every later reader sees a value that no longer moves.
@@ -894,11 +910,15 @@ void initialize() {
                "Shared Index Buffer");
   createBuffer(g_storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
                "Shared Storage Buffer");
+#ifdef AURORA_WEBGPU_BROWSER
+  g_browserStaging = std::make_unique_for_overwrite<uint8_t[]>(StagingBufferSize);
+#else
   for (int i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
     createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
                  label.c_str());
   }
+#endif
   currentStagingBuffer = 0;
   s_mappingState.reset();
   map_staging_buffer();
@@ -1034,6 +1054,9 @@ void map_staging_buffer() {
     return;
   }
 
+#ifdef AURORA_WEBGPU_BROWSER
+  s_mappingState.complete(generation, BufferMapState::Mapped);
+#else
   g_stagingBuffers[currentStagingBuffer].MapAsync(
       wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
       [generation](wgpu::MapAsyncStatus status, wgpu::StringView message) {
@@ -1047,6 +1070,7 @@ void map_staging_buffer() {
         ASSERT(status == wgpu::MapAsyncStatus::Success, "Buffer mapping failed: {} {}", magic_enum::enum_name(status),
                message);
       });
+#endif
 }
 
 static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
@@ -1083,7 +1107,12 @@ static bool begin_frame_impl(bool clearEfb, bool capacityResume = false) {
     if (size <= 0) {
       return;
     }
+#ifdef AURORA_WEBGPU_BROWSER
+    (void)stagingBuf;
+    buf = ByteBuffer{g_browserStaging.get() + bufferOffset, static_cast<size_t>(size)};
+#else
     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+#endif
     bufferOffset += size;
   };
   mapBuffer(g_verts, VertexBufferSize);
@@ -1143,7 +1172,9 @@ void abort_frame() noexcept {
     // Pending interpolation tasks hold raw pointers into the mapped staging
     // range; they must be dropped before the buffer is unmapped and rotated.
     gx::drop_pending_frame_interpolation_uniforms();
+#ifndef AURORA_WEBGPU_BROWSER
     g_stagingBuffers[currentStagingBuffer].Unmap();
+#endif
     s_mappingState.reset();
     currentStagingBuffer = (currentStagingBuffer + 1) % g_stagingBuffers.size();
     map_staging_buffer();
@@ -1176,16 +1207,30 @@ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
   const auto writeBuffer = [&](ByteBuffer& buf, wgpu::Buffer& out, uint64_t size, std::string_view label) {
     const auto writeSize = buf.size(); // Only need to copy this many bytes
     if (writeSize > 0) {
+#ifdef AURORA_WEBGPU_BROWSER
+      // Runs before this batch's command buffer is submitted, and after the previous batch's, so
+      // queue order matches the copy recorded at the start of `cmd` on the other platforms.
+      // The rounded-up tail stays inside the block: every region size is a multiple of 4.
+      g_queue.WriteBuffer(out, 0, buf.data(), AURORA_ALIGN(writeSize, 4));
+      web_perf::count(web_perf::kUploadBytes, static_cast<double>(writeSize));
+#else
       cmd.CopyBufferToBuffer(g_stagingBuffers[currentStagingBuffer], bufferOffset, out, 0, AURORA_ALIGN(writeSize, 4));
+#endif
       buf.release();
     }
     bufferOffset += size;
     return writeSize;
   };
+#ifndef AURORA_WEBGPU_BROWSER
   g_stagingBuffers[currentStagingBuffer].Unmap();
+#endif
   s_mappingState.reset();
   g_stats.drawCallCount = g_drawCallCount;
   g_stats.mergedDrawCallCount = g_mergedDrawCallCount;
+#ifdef AURORA_WEBGPU_BROWSER
+  web_perf::count(web_perf::kDraws, g_drawCallCount);
+  web_perf::count(web_perf::kBatches);
+#endif
   g_stats.lastVertSize = writeBuffer(g_verts, g_vertexBuffer, VertexBufferSize, "Vertex");
   g_stats.lastUniformSize = writeBuffer(g_uniforms, g_uniformBuffer, UniformBufferSize, "Uniform");
   g_stats.lastIndexSize = writeBuffer(g_indices, g_indexBuffer, IndexBufferSize, "Index");
@@ -1204,6 +1249,9 @@ static void end_batch_impl(const wgpu::CommandEncoder& cmd, bool advanceFrame) {
                 },
             .buffer = g_stagingBuffers[currentStagingBuffer],
         };
+#ifdef AURORA_WEBGPU_BROWSER
+        webgpu::browser_checks::buffer_to_texture("texture upload", buf, item.tex, item.size);
+#endif
         cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
       }
       g_textureUploads.clear();
@@ -1395,6 +1443,9 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
             .height = static_cast<uint32_t>(passInfo.resolveSnapshotRect.height),
             .depthOrArrayLayers = 1,
         };
+#ifdef AURORA_WEBGPU_BROWSER
+        webgpu::browser_checks::texture_to_texture("EFB copy snapshot", src, dst, size);
+#endif
         cmd.CopyTextureToTexture(&src, &dst, &size);
         resolveSourceTexture = passInfo.resolveSourceSnapshot->texture;
         resolveSourceView = passInfo.resolveSourceSnapshot->sampleTextureView;
@@ -1437,6 +1488,9 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
             .height = static_cast<uint32_t>(passInfo.resolveRect.height),
             .depthOrArrayLayers = 1,
         };
+#ifdef AURORA_WEBGPU_BROWSER
+        webgpu::browser_checks::texture_to_texture("EFB copy resolve", src, dst, size);
+#endif
         cmd.CopyTextureToTexture(&src, &dst, &size);
       }
     }
@@ -1552,7 +1606,22 @@ static void render_pass_impl(const wgpu::RenderPassEncoder& pass, const std::vec
       // aurora's apply_viewport (lib/gfx/encoding.cpp) exactly.
       const float minDepth = gx::UseReversedZ ? 1.0f - vp.zfar : vp.znear;
       const float maxDepth = gx::UseReversedZ ? 1.0f - vp.znear : vp.zfar;
+#ifdef AURORA_WEBGPU_BROWSER
+      // GX accepts depth ranges past [0,1] (Mario Kart Wii's race scene sets 0.95..1.06), and Dawn
+      // native with validation skipped passes them to the driver. A browser always validates and
+      // rejects the whole command buffer, so clamp here, after the reversed-Z remap above. A range
+      // reaching past 1 is compressed into [x, 1] rather than extended, which can shift depth
+      // compares slightly for what is drawn with it. The rectangle is clamped to the target too
+      // (browser_viewport_clamp in common.hpp).
+      const float browserMinDepth = std::clamp(minDepth, 0.0f, 1.0f);
+      const auto& targetSize = renderPasses[idx].targetSize;
+      const auto clamp = browser_viewport_clamp(vp, static_cast<float>(targetSize.width),
+                                                static_cast<float>(targetSize.height));
+      pass.SetViewport(clamp.left, clamp.top, clamp.width, clamp.height, browserMinDepth,
+                       std::clamp(maxDepth, browserMinDepth, 1.0f));
+#else
       pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
+#endif
     } break;
     case CommandType::SetScissor: {
       const auto& sc = cmd.data.setScissor;
@@ -1613,6 +1682,9 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass, Pipelin
     pipelineReady = wait_pipeline_for_persistent_pass(ref, pipeline);
   } else {
     pipelineReady = try_pipeline(ref, pipeline);
+#ifdef AURORA_WEBGPU_BROWSER
+    if (!pipelineReady) web_perf::count(web_perf::kDrawsSkipped);
+#endif
   }
   if (!pipelineReady) {
     return false;

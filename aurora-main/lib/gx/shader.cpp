@@ -5,6 +5,9 @@
 #include "gx.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "wgsl_prune.hpp"
+#endif
 
 #include <dolphin/gx/GXEnum.h>
 
@@ -667,6 +670,18 @@ static u32 attr_comp_type_size(u8 compType) noexcept {
   }
 }
 
+// ubuf.array_start, the vertex arrays' start offsets: twelve u32 in the uniform buffer. WGSL only
+// allows a 4-byte array stride in the uniform address space with the uniform_buffer_standard_layout
+// language extension, which Safari lacks, so the browser build declares the same 48 bytes as three
+// vec4u (see make_shader).
+static std::string array_start_ref(u32 index) {
+#ifdef AURORA_WEBGPU_BROWSER
+  return fmt::format("ubuf.array_start[{}][{}]", index / 4, index % 4);
+#else
+  return fmt::format("ubuf.array_start[{}]", index);
+#endif
+}
+
 static std::string offset_plus(std::string_view offs, u32 add) {
   if (add == 0) {
     return std::string(offs);
@@ -689,13 +704,13 @@ auto normal_group_load(const ShaderConfig& config, u8 group, std::string_view vi
 
   if (mapping.attrType == GX_INDEX8) {
     const std::string indexOffs = offset_plus(offs, mapping.nrmIndexCount == 3 ? group : 0);
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u + {}u", GX_VA_NRM - GX_VA_POS, buf,
+    offs = fmt::format("{} + raw_fetch_u8_1(&{}, {}) * {}u + {}u", array_start_ref(GX_VA_NRM - GX_VA_POS), buf,
                        indexOffs, mapping.stride, groupOffset);
     buf = "abuf"sv;
     le = mapping.le;
   } else if (mapping.attrType == GX_INDEX16) {
     const std::string indexOffs = offset_plus(offs, mapping.nrmIndexCount == 3 ? group * 2u : 0);
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u + {}u", GX_VA_NRM - GX_VA_POS,
+    offs = fmt::format("{} + raw_fetch_u16_1(&{}, {}, {}) * {}u + {}u", array_start_ref(GX_VA_NRM - GX_VA_POS),
                        buf, indexOffs, le, mapping.stride, groupOffset);
     buf = "abuf"sv;
     le = mapping.le;
@@ -715,13 +730,13 @@ auto attr_load(const ShaderConfig& config, GXAttr attr, std::string_view vidx) -
   auto offs = fmt::format("ubuf.vtx_start + {} * {}u + {}u", vidx, config.vtxStride, mapping.offset);
   auto le = false; // Vertex buffer is always big endian (for now)
   if (mapping.attrType == GX_INDEX8) {
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u8_1(&{}, {}) * {}u", attr - GX_VA_POS, buf, offs,
+    offs = fmt::format("{} + raw_fetch_u8_1(&{}, {}) * {}u", array_start_ref(attr - GX_VA_POS), buf, offs,
                        mapping.stride);
     buf = "abuf"sv;
     le = mapping.le;
   } else if (mapping.attrType == GX_INDEX16) {
-    offs = fmt::format("ubuf.array_start[{}] + raw_fetch_u16_1(&{}, {}, {}) * {}u", attr - GX_VA_POS, buf, offs, le,
-                       mapping.stride);
+    offs = fmt::format("{} + raw_fetch_u16_1(&{}, {}, {}) * {}u", array_start_ref(attr - GX_VA_POS), buf, offs,
+                       le, mapping.stride);
     buf = "abuf"sv;
     le = mapping.le;
   }
@@ -2082,7 +2097,19 @@ fn fs_main(in: VertexOutput) -> {9} {{{6}{5}
                                         fragmentFnPre, vtxXfrAttrsPre, uniformPre, fragmentReturnType,
                                         fragmentReturn);
   wgpu::ShaderSourceWGSL wgslDescriptor{};
+#ifdef AURORA_WEBGPU_BROWSER
+  // See array_start_ref.
+  std::string browserSource = shaderSource;
+  constexpr std::string_view arrayStartDecl = "array_start: array<u32, 12>,";
+  const auto arrayStartAt = browserSource.find(arrayStartDecl);
+  if (arrayStartAt != std::string::npos) {
+    browserSource.replace(arrayStartAt, arrayStartDecl.size(), "array_start: array<vec4u, 3>,");
+  }
+  browserSource = prune_unused_wgsl_functions(browserSource);
+  wgslDescriptor.code = browserSource.c_str();
+#else
   wgslDescriptor.code = shaderSource.c_str();
+#endif
   const auto label = fmt::format("GX Shader {:x}", hash);
   const auto shaderDescriptor = wgpu::ShaderModuleDescriptor{
       .nextInChain = &wgslDescriptor,

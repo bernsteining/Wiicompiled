@@ -373,6 +373,13 @@ static wgpu::BindGroupLayout g_depthBindGroupLayout;
 static wgpu::Sampler g_nearestSampler;
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
+#ifdef AURORA_WEBGPU_BROWSER
+// The destination is a render texture in the surface format, which is BGRA8 in Safari (and on
+// Apple GPUs generally). A browser validates the pipeline's target format against the attachment
+// and drops the whole command buffer on a mismatch, so the browser build also has BGRA8 variants.
+// The shader writes logical RGBA either way; the attachment's format decides the byte order.
+static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_bgraPipelines;
+#endif
 static absl::flat_hash_map<wgpu::TextureFormat, wgpu::RenderPipeline> g_blitPipelines;
 
 static wgpu::RenderPipeline create_pipeline(const ConvPipeline& conv, const std::string_view shaderPreamble,
@@ -498,12 +505,22 @@ void initialize() {
     if (conv.outputFormat != to_wgpu(conv.fmt)) {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
+#ifdef AURORA_WEBGPU_BROWSER
+    ConvPipeline bgra = conv;
+    bgra.outputFormat = wgpu::TextureFormat::BGRA8Unorm;
+    g_bgraPipelines[conv.fmt] = create_pipeline(bgra, ShaderPreamble, g_bindGroupLayout);
+#endif
   }
   for (const auto& conv : DepthConvPipelines) {
     g_pipelines[conv.fmt] = create_pipeline(conv, DepthShaderPreamble, g_depthBindGroupLayout);
     if (conv.outputFormat != to_wgpu(conv.fmt)) {
       Log.fatal("Output format mismatch for {}", conv.fmt);
     }
+#ifdef AURORA_WEBGPU_BROWSER
+    ConvPipeline bgra = conv;
+    bgra.outputFormat = wgpu::TextureFormat::BGRA8Unorm;
+    g_bgraPipelines[conv.fmt] = create_pipeline(bgra, DepthShaderPreamble, g_depthBindGroupLayout);
+#endif
   }
 
   static constexpr wgpu::SamplerDescriptor nearestSamplerDescriptor{
@@ -523,6 +540,9 @@ void initialize() {
 
 void shutdown() {
   g_pipelines.clear();
+#ifdef AURORA_WEBGPU_BROWSER
+  g_bgraPipelines.clear();
+#endif
   g_blitPipelines.clear();
   g_bindGroupLayout = {};
   g_depthBindGroupLayout = {};
@@ -598,8 +618,13 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 }
 
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
-  const auto it = g_pipelines.find(req.fmt);
-  if (it == g_pipelines.end()) {
+#ifdef AURORA_WEBGPU_BROWSER
+  auto& pipelines = req.dst->format == wgpu::TextureFormat::BGRA8Unorm ? g_bgraPipelines : g_pipelines;
+#else
+  auto& pipelines = g_pipelines;
+#endif
+  const auto it = pipelines.find(req.fmt);
+  if (it == pipelines.end()) {
     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));
   }
   execute(cmd, req, it->second);

@@ -3,6 +3,9 @@
 #include "../dolphin/vi/vi_internal.hpp"
 #include "../gx/gx.hpp"
 #include "../webgpu/gpu.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../webgpu/browser_checks.hpp"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -417,6 +420,9 @@ void encode_frame_snapshot(const wgpu::CommandEncoder& cmd, const wgpu::TextureV
                           (dstSize.y + WorkgroupSizeY - 1) / WorkgroupSizeY);
   pass.End();
 
+#ifdef AURORA_WEBGPU_BROWSER
+  webgpu::browser_checks::buffer_to_buffer("depth peek readback", storageBuffer, 0, readbackBuffer, 0, byteSize);
+#endif
   cmd.CopyBufferToBuffer(storageBuffer, 0, readbackBuffer, 0, byteSize);
 }
 

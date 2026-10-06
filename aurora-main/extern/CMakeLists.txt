@@ -141,7 +141,8 @@ endif ()
 
 # fmt 11.1 drops its libc++ transitive includes but still calls malloc/free without <cstdlib>.
 # Force the missing header for fmt and its consumers until the pinned release is updated.
-if (MINGW AND TARGET fmt)
+# Emscripten also uses libc++.
+if ((MINGW OR EMSCRIPTEN) AND TARGET fmt)
   target_compile_options(fmt PUBLIC
     $<$<COMPILE_LANGUAGE:CXX>:-include>
     $<$<COMPILE_LANGUAGE:CXX>:cstdlib>)
@@ -255,11 +256,33 @@ if (AURORA_ENABLE_GX)
     )
     target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR})
 
+    set(_aurora_imgui_wgpu_source ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp)
+    if (EMSCRIPTEN)
+      # This imgui's WebGPU backend predates emdawnwebgpu: under Emscripten it rejects the Dawn
+      # backend and expects Emscripten's removed built-in WebGPU API. emdawnwebgpu implements
+      # Dawn's API, so compile the Dawn code path from a copy with only that guard removed.
+      file(READ ${_aurora_imgui_wgpu_source} _aurora_imgui_wgpu)
+      set(_aurora_imgui_wgpu_guard
+        "#error neither IMGUI_IMPL_WEBGPU_BACKEND_DAWN nor IMGUI_IMPL_WEBGPU_BACKEND_WGPU may be defined if targeting emscripten!")
+      string(FIND "${_aurora_imgui_wgpu}" "${_aurora_imgui_wgpu_guard}" _aurora_imgui_wgpu_guard_at)
+      if (_aurora_imgui_wgpu_guard_at EQUAL -1)
+        message(FATAL_ERROR "aurora: imgui_impl_wgpu.cpp changed; revisit the emdawnwebgpu patch")
+      endif ()
+      string(REPLACE "${_aurora_imgui_wgpu_guard}" "" _aurora_imgui_wgpu "${_aurora_imgui_wgpu}")
+      file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/imgui_impl_wgpu_emdawnwebgpu.cpp.in "${_aurora_imgui_wgpu}")
+      configure_file(${CMAKE_CURRENT_BINARY_DIR}/imgui_impl_wgpu_emdawnwebgpu.cpp.in
+        ${CMAKE_CURRENT_BINARY_DIR}/imgui_impl_wgpu_emdawnwebgpu.cpp COPYONLY)
+      set(_aurora_imgui_wgpu_source ${CMAKE_CURRENT_BINARY_DIR}/imgui_impl_wgpu_emdawnwebgpu.cpp)
+    endif ()
     add_library(imgui_backends STATIC
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
       ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
-      ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+      ${_aurora_imgui_wgpu_source}
     )
+    if (EMSCRIPTEN)
+      # The generated copy is outside backends/ but includes its header from there.
+      target_include_directories(imgui_backends PRIVATE ${imgui_SOURCE_DIR}/backends)
+    endif ()
     target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
     target_link_libraries(imgui_backends PRIVATE imgui ${AURORA_SDL3_TARGET} dawn::webgpu_dawn)
     target_link_libraries(imgui PUBLIC imgui_backends)

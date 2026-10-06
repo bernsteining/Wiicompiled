@@ -2,6 +2,9 @@
 
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../web_perf.hpp"
+#endif
 #include "aurora/aurora.h"
 #include "texture.hpp"
 #include "texture_convert.hpp"
@@ -136,6 +139,10 @@ TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mi
           .rowsPerImage = heightBlocks,
       };
       g_queue.WriteTexture(&dstView, data.data() + offset, dataSize, &dataLayout, &physicalSize);
+#ifdef AURORA_WEBGPU_BROWSER
+      web_perf::count(web_perf::kTextureUploads);
+      web_perf::count(web_perf::kTextureBytes, static_cast<double>(dataSize));
+#endif
     }
     offset += dataSize;
   }
@@ -293,6 +300,10 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {
           .rowsPerImage = heightBlocks,
       };
       g_queue.WriteTexture(&dstView, data.data() + offset, dataSize, &dataLayout, &physicalSize);
+#ifdef AURORA_WEBGPU_BROWSER
+      web_perf::count(web_perf::kTextureUploads);
+      web_perf::count(web_perf::kTextureBytes, static_cast<double>(dataSize));
+#endif
     }
     offset += dataSize;
   }

@@ -1,4 +1,7 @@
 #include "efb_ram_copy.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../webgpu/browser_checks.hpp"
+#endif
 
 #include "efb_ram_encoder.hpp"
 #include "tex_copy_conv.hpp"
@@ -291,6 +294,9 @@ void encode_downloads(const wgpu::CommandEncoder& encoder, void* dest) noexcept 
             },
         .buffer = buffer,
     };
+#ifdef AURORA_WEBGPU_BROWSER
+    webgpu::browser_checks::texture_to_buffer("EFB to RAM copy", source, destination, texture->size);
+#endif
     encoder.CopyTextureToBuffer(&source, &destination, &texture->size);
     g_downloads.push_back({
         .copy = std::move(pending),
@@ -427,6 +433,9 @@ void encode_async_downloads(const wgpu::CommandEncoder& encoder) noexcept {
             },
         .buffer = slot.buffer,
     };
+#ifdef AURORA_WEBGPU_BROWSER
+    webgpu::browser_checks::texture_to_buffer("EFB to RAM copy", source, destination, texture->size);
+#endif
     encoder.CopyTextureToBuffer(&source, &destination, &texture->size);
     slot.bytesPerRow = bytesPerRow;
     slot.dest = pending.dest;

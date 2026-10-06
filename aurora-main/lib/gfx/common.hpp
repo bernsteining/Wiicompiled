@@ -4,6 +4,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -416,6 +417,47 @@ Vec2<uint32_t> get_render_target_size() noexcept;
 Vec2<uint32_t> get_frame_buffer_size() noexcept;
 void set_viewport(const Viewport& viewport) noexcept;
 void set_scissor(const ClipRect& scissor) noexcept;
+
+#ifdef AURORA_WEBGPU_BROWSER
+// GX allows a viewport larger than the render target (the hardware clips), and so do Vulkan, D3D12
+// and Chrome's WebGPU, but WebKit rejects one reaching outside the target and drops the command
+// buffer. The browser build sets the viewport clamped to the target (render_pass_impl) and maps
+// clip space so geometry lands where the full viewport would put it (effective_projection in
+// lib/gx/shader_info.cpp): clip.x' = scaleX * clip.x + offsetX * clip.w, likewise for y.
+struct BrowserViewportClamp {
+  bool active = false;
+  float left = 0.0f, top = 0.0f, width = 0.0f, height = 0.0f;
+  float scaleX = 1.0f, scaleY = 1.0f, offsetX = 0.0f, offsetY = 0.0f;
+};
+
+inline BrowserViewportClamp browser_viewport_clamp(const Viewport& vp, float targetWidth,
+                                                   float targetHeight) noexcept {
+  BrowserViewportClamp clamp{.left = vp.left, .top = vp.top, .width = vp.width, .height = vp.height};
+  if (vp.width <= 0.0f || vp.height <= 0.0f || targetWidth < 1.0f || targetHeight < 1.0f) {
+    return clamp;
+  }
+  // At least one pixel, so a viewport entirely outside the target still maps its geometry outside
+  // the clip volume instead of collapsing it.
+  const float left = std::clamp(vp.left, 0.0f, targetWidth - 1.0f);
+  const float top = std::clamp(vp.top, 0.0f, targetHeight - 1.0f);
+  const float right = std::clamp(vp.left + vp.width, left + 1.0f, targetWidth);
+  const float bottom = std::clamp(vp.top + vp.height, top + 1.0f, targetHeight);
+  if (left == vp.left && top == vp.top && right == vp.left + vp.width && bottom == vp.top + vp.height) {
+    return clamp;
+  }
+  clamp.active = true;
+  clamp.left = left;
+  clamp.top = top;
+  clamp.width = right - left;
+  clamp.height = bottom - top;
+  // Window x = left + (ndc.x + 1) / 2 * width; window y = top + (1 - ndc.y) / 2 * height.
+  clamp.scaleX = vp.width / clamp.width;
+  clamp.scaleY = vp.height / clamp.height;
+  clamp.offsetX = (2.0f * (vp.left - left) + vp.width - clamp.width) / clamp.width;
+  clamp.offsetY = (clamp.height - vp.height - 2.0f * (vp.top - top)) / clamp.height;
+  return clamp;
+}
+#endif
 
 void push_debug_group(std::string label);
 void insert_debug_marker(std::string label);

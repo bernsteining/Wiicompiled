@@ -1,3 +1,6 @@
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../web_perf.hpp"
+#endif
 #include "command_processor.hpp"
 
 #include "../gfx/common.hpp"
@@ -482,6 +485,9 @@ static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 
 uint32_t process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
+#ifdef AURORA_WEBGPU_BROWSER
+  const web_perf::Scope perfScope(web_perf::kGxDecode);
+#endif
   // Everything decoded here mutates renderer state (GX state, the recorded command lists and the mapped staging buffers), so take the renderer GPU mutex once for the whole drain rather than once per draw command.
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   u32 pos = 0;

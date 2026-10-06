@@ -5,6 +5,9 @@
 #include "../fs_helper.hpp"
 #include "../sqlite_utils.hpp"
 #include "../webgpu/gpu.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../web_perf.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -82,6 +85,34 @@ static absl::flat_hash_map<PipelineRef, CachedPipeline> g_pipelines;
 static std::deque<PendingPipeline> g_priorityPipelines;
 static std::deque<PendingPipeline> g_backgroundPipelines;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
+#ifdef AURORA_WEBGPU_BROWSER
+// The browser build has no compile threads. Queued pipelines compile through
+// createRenderPipelineAsync instead: the browser builds them on its own threads while the game
+// keeps rendering, as the worker pool does natively, and draws skip a pipeline that is not ready.
+// While compile_pending_pipeline runs a pending pipeline's factory, create_render_pipeline starts
+// the asynchronous compile; Instance::ProcessEvents (begin_frame, after_submit) delivers the result.
+// The pending entry stays in g_asyncPipelines until then, so a pass that must not skip the draw can
+// still compile it synchronously (wait_pipeline_impl).
+constexpr bool AsyncPipelines = true;
+constexpr size_t StartAsyncPipelinesPerFrame = 32;
+constexpr size_t MaxAsyncPipelinesInFlight = 64;
+// The embedder may lower the in-flight limit (Module.mkwPipelinesInFlight): Safari compiles one
+// pipeline at a time with the whole page stalled, ~100-300 ms each when it has not cached it, so
+// 64 queued compiles freeze the screen for seconds; a few at a time let it update in between.
+EM_JS(int, aurora_web_pipelines_in_flight, (), { return Module['mkwPipelinesInFlight'] | 0; });
+static size_t async_pipelines_in_flight_limit() {
+  static const size_t limit = [] {
+    const int asked = aurora_web_pipelines_in_flight();
+    return asked > 0 ? std::min<size_t>(static_cast<size_t>(asked), MaxAsyncPipelinesInFlight) : MaxAsyncPipelinesInFlight;
+  }();
+  return limit;
+}
+static absl::flat_hash_map<PipelineRef, PendingPipeline> g_asyncPipelines;
+static PendingPipeline* g_asyncFactoryPipeline = nullptr;
+static bool g_asyncCompileStarted = false;
+#else
+constexpr bool AsyncPipelines = false;
+#endif
 
 static sqlite3* g_pipelineCacheDb = nullptr;
 static sqlite3_stmt* g_pipelineCacheLoadStmt = nullptr;
@@ -448,7 +479,8 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
   std::optional<PipelineCacheWrite> cacheWrite;
   {
     std::scoped_lock guard{g_pipelineMutex};
-    const bool deferGxPipeline = g_hasPipelineThread && g_pipelineFrameActive && type == ShaderType::GX;
+    const bool deferGxPipeline =
+        (g_hasPipelineThread || AsyncPipelines) && g_pipelineFrameActive && type == ShaderType::GX;
     const bool skipUnreadyGxPipeline = deferGxPipeline && g_skipUnreadyGxPipelines.load(std::memory_order_relaxed);
     auto pipelineIt = g_pipelines.find(hash);
     if (pipelineIt != g_pipelines.end()) {
@@ -899,6 +931,35 @@ static bool write_pipeline_cache_record(const PipelineCacheWrite& write) {
   return true;
 }
 
+// Writes one batch in a transaction. Returns false (after aborting the cache) on failure.
+static bool write_pipeline_cache_batch(const std::deque<PipelineCacheWrite>& batch) {
+  bool writeFailed = false;
+  {
+    sqlite::Transaction tx(g_pipelineCacheDb, Log, true);
+    if (!tx) {
+      Log.error("Failed to begin pipeline cache write transaction");
+      writeFailed = true;
+    } else {
+      for (const auto& write : batch) {
+        if (!write_pipeline_cache_record(write)) {
+          writeFailed = true;
+          break;
+        }
+      }
+
+      if (!writeFailed) {
+        tx.commit();
+      }
+    }
+  }
+
+  if (writeFailed) {
+    pipeline_cache_abort();
+    return false;
+  }
+  return true;
+}
+
 static void pipeline_cache_writer() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline cache writer thread");
@@ -917,32 +978,24 @@ static void pipeline_cache_writer() {
       g_pipelineCachePendingWrites.clear();
     }
 
-    bool writeFailed = false;
-    {
-      sqlite::Transaction tx(g_pipelineCacheDb, Log, true);
-      if (!tx) {
-        Log.error("Failed to begin pipeline cache write transaction");
-        writeFailed = true;
-      } else {
-        for (const auto& write : batch) {
-          if (!write_pipeline_cache_record(write)) {
-            writeFailed = true;
-            break;
-          }
-        }
-
-        if (!writeFailed) {
-          tx.commit();
-        }
-      }
-    }
-
-    if (writeFailed) {
-      pipeline_cache_abort();
+    if (!write_pipeline_cache_batch(batch)) {
       return;
     }
   }
 }
+
+#ifdef __EMSCRIPTEN__
+// The web build has no threads: queued cache records are written at frame boundaries instead.
+static void flush_pipeline_cache_writes_inline() {
+  if (g_pipelineCacheBroken || g_pipelineCacheDb == nullptr || g_pipelineCacheWriteQueue.empty()) {
+    return;
+  }
+  std::deque<PipelineCacheWrite> batch;
+  batch.swap(g_pipelineCacheWriteQueue);
+  g_pipelineCachePendingWrites.clear();
+  write_pipeline_cache_batch(batch);
+}
+#endif
 
 // Boot prewarm telemetry: how long the cached-recipe rebuild takes and how well the
 // Dawn blob cache served it. Logged once, when the launch queue first drains.
@@ -967,15 +1020,14 @@ static void note_pipeline_queue_drained() {
            static_cast<double>(stats.hitBytes) / (1024.0 * 1024.0));
 }
 
-static void compile_pending_pipeline(PendingPipeline pending) {
-  auto result = pending.create();
+static void finish_pipeline(PipelineRef hash, uint32_t firstFrameUsed, wgpu::RenderPipeline pipeline) {
   {
     std::lock_guard lock{g_pipelineMutex};
-    const auto [_, inserted] = g_pipelines.try_emplace(pending.hash, CachedPipeline{
-                                                                         .pipeline = std::move(result),
-                                                                         .firstFrameUsed = pending.firstFrameUsed,
-                                                                     });
-    g_pendingPipelines.erase(pending.hash);
+    const auto [_, inserted] = g_pipelines.try_emplace(hash, CachedPipeline{
+                                                                 .pipeline = std::move(pipeline),
+                                                                 .firstFrameUsed = firstFrameUsed,
+                                                             });
+    g_pendingPipelines.erase(hash);
     if (inserted) {
       ++createdPipelines;
     }
@@ -985,6 +1037,89 @@ static void compile_pending_pipeline(PendingPipeline pending) {
   if (queuedPipelines.load() == 0) {
     note_pipeline_queue_drained();
   }
+}
+
+#ifdef AURORA_WEBGPU_BROWSER
+static void finish_async_pipeline(PipelineRef hash, wgpu::CreatePipelineAsyncStatus status,
+                                  wgpu::RenderPipeline pipeline, wgpu::StringView message) {
+  const auto it = g_asyncPipelines.find(hash);
+  if (it == g_asyncPipelines.end()) {
+    return; // already compiled synchronously by wait_pipeline_impl, or the cache was shut down
+  }
+  PendingPipeline pending = std::move(it->second);
+  g_asyncPipelines.erase(it);
+  if (status != wgpu::CreatePipelineAsyncStatus::Success) {
+    // Compile it synchronously instead, so the device reports the real error.
+    Log.error("Pipeline 0x{:x} failed to compile asynchronously ({}); compiling it synchronously",
+              static_cast<uint64_t>(hash), message);
+    pipeline = pending.create();
+  }
+  finish_pipeline(hash, pending.firstFrameUsed, std::move(pipeline));
+}
+
+wgpu::RenderPipeline create_render_pipeline(const wgpu::RenderPipelineDescriptor& descriptor) {
+  const double started = emscripten_get_now();
+  if (g_asyncFactoryPipeline == nullptr) {
+    auto pipeline = webgpu::g_device.CreateRenderPipeline(&descriptor);
+    web_perf::count(web_perf::kPipelinesNow);
+    web_perf::count(web_perf::kPipelineNowMs, emscripten_get_now() - started);
+    return pipeline;
+  }
+  const PipelineRef hash = g_asyncFactoryPipeline->hash;
+  g_asyncCompileStarted = true;
+  web_perf::count(web_perf::kPipelinesStarted);
+  webgpu::g_device.CreateRenderPipelineAsync(
+      &descriptor, wgpu::CallbackMode::AllowProcessEvents,
+      [hash, started](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline pipeline, wgpu::StringView message) {
+        web_perf::count(web_perf::kPipelinesFinished);
+        web_perf::count(web_perf::kPipelineAsyncMs, emscripten_get_now() - started);
+        finish_async_pipeline(hash, status, std::move(pipeline), message);
+      });
+  return {};
+}
+
+// Compiles a queued or in-flight pipeline right away, for a pass that must not skip its draw.
+static void compile_pipeline_now(PipelineRef hash) {
+  std::optional<PendingPipeline> pending;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    for (auto* queue : {&g_priorityPipelines, &g_backgroundPipelines}) {
+      const auto it = find_pending_pipeline(*queue, hash);
+      if (it != queue->end()) {
+        pending = std::move(*it);
+        queue->erase(it);
+        break;
+      }
+    }
+  }
+  if (!pending) {
+    const auto it = g_asyncPipelines.find(hash);
+    if (it == g_asyncPipelines.end()) {
+      return;
+    }
+    pending = std::move(it->second);
+    g_asyncPipelines.erase(it);
+  }
+  auto pipeline = pending->create(); // counted by create_render_pipeline
+  finish_pipeline(hash, pending->firstFrameUsed, std::move(pipeline));
+}
+#endif
+
+static void compile_pending_pipeline(PendingPipeline pending) {
+#ifdef AURORA_WEBGPU_BROWSER
+  g_asyncFactoryPipeline = &pending;
+  g_asyncCompileStarted = false;
+  auto result = pending.create();
+  g_asyncFactoryPipeline = nullptr;
+  if (g_asyncCompileStarted) {
+    const PipelineRef hash = pending.hash;
+    g_asyncPipelines.emplace(hash, std::move(pending));
+    return;
+  }
+#else
+  auto result = pending.create();
+#endif
+  finish_pipeline(pending.hash, pending.firstFrameUsed, std::move(result));
 }
 
 static void pipeline_worker() {
@@ -1026,7 +1161,12 @@ static void pipeline_worker() {
 }
 
 static void build_synchronous_pipelines_for_frame() {
+#ifdef AURORA_WEBGPU_BROWSER
+  // Each start is cheap; the browser compiles them in parallel. Bound the burst all the same.
+  while (g_pipelinesPerFrame < StartAsyncPipelinesPerFrame && g_asyncPipelines.size() < async_pipelines_in_flight_limit()) {
+#else
   while (g_pipelinesPerFrame < BuildPipelinesPerFrame) {
+#endif
     PendingPipeline pending;
     {
       std::lock_guard lock{g_pipelineMutex};
@@ -1133,7 +1273,9 @@ static void start_pipeline_cache_writer() {
   }
 
   g_pipelineCacheWriterStop = false;
+#ifndef __EMSCRIPTEN__
   g_pipelineCacheWriterThread = std::thread(pipeline_cache_writer);
+#endif
 }
 
 static void stop_pipeline_cache_writer() {
@@ -1147,6 +1289,9 @@ static void stop_pipeline_cache_writer() {
   } else {
     g_pipelineCacheWriterStop = false;
   }
+#ifdef __EMSCRIPTEN__
+  flush_pipeline_cache_writes_inline();
+#endif
 
   g_pipelineCacheWriteQueue.clear();
   g_pipelineCachePendingWrites.clear();
@@ -1213,6 +1358,9 @@ void shutdown_pipeline_cache() {
   g_priorityPipelines.clear();
   g_backgroundPipelines.clear();
   g_pendingPipelines.clear();
+#ifdef AURORA_WEBGPU_BROWSER
+  g_asyncPipelines.clear();
+#endif
 
   queuedPipelines = 0;
   createdPipelines = 0;
@@ -1230,6 +1378,9 @@ void end_pipeline_frame() {
   if (!g_hasPipelineThread) {
     build_synchronous_pipelines_for_frame();
   }
+#ifdef __EMSCRIPTEN__
+  flush_pipeline_cache_writes_inline();
+#endif
 }
 
 void set_skip_unready_pipelines(bool enabled) noexcept {
@@ -1258,6 +1409,17 @@ bool try_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
 
 static bool wait_pipeline_impl(PipelineRef ref, wgpu::RenderPipeline& pipeline, bool fatalIfMissing,
                                bool persistentPass) {
+#ifdef AURORA_WEBGPU_BROWSER
+  // There is no compile thread to wait for: build it now.
+  bool compileNow = false;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    compileNow = !g_pipelines.contains(ref) && g_pendingPipelines.contains(ref);
+  }
+  if (compileNow) {
+    compile_pipeline_now(ref);
+  }
+#endif
   std::unique_lock lock{g_pipelineMutex};
   if (!g_pipelines.contains(ref) && g_pendingPipelines.contains(ref)) {
     ZoneScopedN("wait_pipeline");
@@ -1271,7 +1433,11 @@ static bool wait_pipeline_impl(PipelineRef ref, wgpu::RenderPipeline& pipeline, 
       // A persistent resolve is the last chance to produce its texture, so timing out here corrupts it
       // permanently. Only a pass marked requireReadyPipelines takes this path.
     }
+#ifndef AURORA_WEBGPU_BROWSER
     g_pipelineCv.wait(lock, finished);
+#else
+    (void)finished; // compiled above; nothing could signal a wait on the single browser thread
+#endif
   }
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {

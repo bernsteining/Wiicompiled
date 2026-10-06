@@ -6,6 +6,9 @@
 #include "../webgpu/gpu.hpp"
 #include "../internal.hpp"
 #include "../gfx/common.hpp"
+#ifdef AURORA_WEBGPU_BROWSER
+#include "../gfx/pipeline_cache.hpp"
+#endif
 #include "../gfx/tex_palette_conv.hpp"
 #include "../gfx/texture.hpp"
 #include "../gfx/texture_convert.hpp"
@@ -1642,7 +1645,11 @@ wgpu::RenderPipeline build_pipeline(const PipelineConfig& config, ArrayRef<wgpu:
           },
       .fragment = &fragmentState,
   };
+#ifdef AURORA_WEBGPU_BROWSER
+  return gfx::create_render_pipeline(descriptor);
+#else
   return g_device.CreateRenderPipeline(&descriptor);
+#endif
 }
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept {

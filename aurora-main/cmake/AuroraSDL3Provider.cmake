@@ -35,6 +35,10 @@ endfunction()
 
 # ── Auto: resolve provider based on platform availability ──
 set(_aurora_sdl3_provider "${AURORA_SDL3_PROVIDER}")
+if (EMSCRIPTEN)
+  # Emscripten's sdl3 port, built for wasm with the browser video/audio/gamepad backends.
+  set(_aurora_sdl3_provider "emscripten")
+endif ()
 if (_aurora_sdl3_provider STREQUAL "auto")
   # Prebuilt SDL3 packages are available for Windows (MSVC and MinGW)
   if (WIN32)
@@ -56,7 +60,16 @@ if (_aurora_sdl3_provider STREQUAL "auto")
   message(STATUS "aurora: SDL3 auto-resolved provider: ${_aurora_sdl3_provider}")
 endif ()
 
-if (_aurora_sdl3_provider STREQUAL "system")
+if (_aurora_sdl3_provider STREQUAL "emscripten")
+  if (NOT TARGET SDL3::SDL3-static)
+    add_library(aurora_emscripten_sdl3 INTERFACE)
+    target_compile_options(aurora_emscripten_sdl3 INTERFACE --use-port=sdl3)
+    target_link_options(aurora_emscripten_sdl3 INTERFACE --use-port=sdl3)
+    add_library(SDL3::SDL3-static ALIAS aurora_emscripten_sdl3)
+  endif ()
+  set(AURORA_SDL3_TARGET SDL3::SDL3-static CACHE INTERNAL "")
+
+elseif (_aurora_sdl3_provider STREQUAL "system")
   # ── System: find_package(SDL3) ──
   message(STATUS "aurora: Using system SDL3 (provider=system)")
   if (NOT SDL3_FOUND)
