@@ -111,6 +111,16 @@ namespace {
 struct CachedBindGroup {
   wgpu::BindGroup bindGroup;
   uint32_t lastUsedFrame = 0;
+#ifdef AURORA_WEBGPU_BROWSER
+  // The cache is keyed by the entries' handle values. A Dawn bind group keeps the objects it binds
+  // alive, so natively those handles cannot be freed and reused while it is cached. A browser bind
+  // group only holds the JavaScript objects: a texture view released while its bind group is still
+  // cached frees its handle, a new view can get the same address, and its draws would be given the
+  // old bind group, i.e. the old texture. These references keep the handles alive instead.
+  std::vector<wgpu::TextureView> textureViews;
+  std::vector<wgpu::Sampler> samplers;
+  std::vector<wgpu::Buffer> buffers;
+#endif
 };
 
 constexpr uint32_t BindGroupCacheRetainFrames = 32;
@@ -1781,10 +1791,19 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
   const auto it = g_cachedBindGroups.find(id);
   if (it == g_cachedBindGroups.end()) {
     auto bg = wgpu::BindGroup::Acquire(wgpuDeviceCreateBindGroup(g_device.Get(), &descriptor));
-    g_cachedBindGroups.emplace(id, CachedBindGroup{
-                                       .bindGroup = std::move(bg),
-                                       .lastUsedFrame = g_frameIndex,
-                                   });
+    CachedBindGroup cached{
+        .bindGroup = std::move(bg),
+        .lastUsedFrame = g_frameIndex,
+    };
+#ifdef AURORA_WEBGPU_BROWSER
+    for (size_t i = 0; i < descriptor.entryCount; ++i) {
+      const auto& entry = descriptor.entries[i];
+      if (entry.textureView != nullptr) cached.textureViews.emplace_back(entry.textureView);
+      if (entry.sampler != nullptr) cached.samplers.emplace_back(entry.sampler);
+      if (entry.buffer != nullptr) cached.buffers.emplace_back(entry.buffer);
+    }
+#endif
+    g_cachedBindGroups.emplace(id, std::move(cached));
   } else {
     it->second.lastUsedFrame = g_frameIndex;
   }
