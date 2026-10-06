@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiiCompiled</title>
+  <style>
+    :root { color-scheme: dark; }
+    html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 14px system-ui, sans-serif; }
+    #canvas { display: block; width: 100vw; height: 100vh; outline: none; }
+    #mkw-overlay {
+      position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 12px; pointer-events: none;
+    }
+    #mkw-overlay[hidden], #mkw-overlay > [hidden] { display: none; }
+    #mkw-overlay > * { pointer-events: auto; }
+    #mkw-setup { display: flex; flex-direction: column; align-items: center; gap: 10px; max-width: calc(100vw - 32px); text-align: center; }
+    #mkw-setup[hidden], #mkw-setup [hidden] { display: none; }
+    #mkw-setup button { font: inherit; padding: 8px 16px; cursor: pointer; }
+    #mkw-setup .mkw-hint { color: #999; font-size: 12px; }
+    #mkw-notice {
+      position: fixed; top: 12px; left: 50%; transform: translateX(-50%); max-width: calc(100vw - 32px);
+      padding: 8px 12px; border-radius: 6px; background: rgba(0, 0, 0, 0.8); pointer-events: none;
+    }
+    #mkw-notice[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="mkw-notice" hidden></div>
+  <div id="mkw-overlay">
+    <div id="mkw-status">Loading...</div>
+    <div id="mkw-progress"></div>
+    <div id="mkw-setup" hidden>
+      <div>
+        <button id="mkw-pick-image">Open disc image</button>
+        <button id="mkw-pick-folder" hidden>Open extracted folder</button>
+      </div>
+      <div class="mkw-hint">.wbfs, .iso, .rvz, .wia, .ciso or .gcz (or drop it on the page). It is read where it is, never uploaded.</div>
+      <label id="mkw-install-row" hidden><input type="checkbox" id="mkw-install" checked>
+        Install in this browser (about 2.7 GB), so it starts without picking anything next time</label>
+      <input type="file" id="mkw-image-input" hidden>
+      <input type="file" id="mkw-folder-input" webkitdirectory multiple hidden>
+    </div>
+  </div>
+  <script>
+    // With ?log, page output, errors and startup steps also go to the server (serve.py
+    // --remote-log prints them), for browsers whose console is out of reach, like an iPad's.
+    var mkwLog = (() => {
+      if (!new URLSearchParams(location.search).has('log')) return () => {};
+      let lines = [];
+      const flush = (keepalive) => {
+        if (!lines.length) return;
+        fetch('/log', { method: 'POST', body: lines.join('\n'), keepalive }).catch(() => {});
+        lines = [];
+      };
+      setInterval(() => flush(false), 1000);
+      addEventListener('pagehide', () => flush(true));
+      return (line) => { lines.push(`${(performance.now() / 1000).toFixed(1)}s ${line}`); };
+    })();
+    mkwLog(navigator.userAgent);
+
+    // ?lowres: draw for a 1x display, so a high-density screen (an iPad's is 2x) fills a quarter of
+    // the pixels; the loader also sets the game's render scale to 1 (the Wii's own resolution).
+    if (new URLSearchParams(location.search).has('lowres')) {
+      // devicePixelRatio is a replaceable attribute: plain assignment shadows it everywhere.
+      window.devicePixelRatio = 1;
+      mkwLog(`lowres: devicePixelRatio ${window.devicePixelRatio}`);
+    }
+    addEventListener('error', (e) => mkwLog(`error: ${e.message} (${e.filename}:${e.lineno})`));
+    addEventListener('unhandledrejection', (e) => mkwLog(`unhandled rejection: ${(e.reason && e.reason.stack) || e.reason}`));
+
+    // The game needs WebGPU, which browsers only offer on https:// or localhost, and JSPI. Name
+    // what is missing up front instead of failing later with an obscure error.
+    var mkwMissing = !window.isSecureContext
+      ? 'This page has to be opened over https:// or from localhost: browsers only enable WebGPU there.'
+      : typeof WebAssembly !== 'object' ? 'WebAssembly is turned off in this browser (Lockdown Mode does that).'
+      : !navigator.gpu ? 'This browser has no WebGPU, which the game needs.'
+      : !('Suspending' in WebAssembly) ? 'This browser lacks WebAssembly JSPI, which the game needs (Chrome and Edge 137+ have it).'
+      : '';
+    if (mkwMissing) {
+      document.getElementById('mkw-status').textContent = mkwMissing;
+      mkwLog(mkwMissing);
+    }
+
+    // A build made with -DMKW_WEB_FMA=relaxed uses relaxed-SIMD instructions, which Safari rejects
+    // (it refuses the whole module). This module holds one f32x4.relaxed_madd.
+    var mkwHasRelaxedSimd = () => WebAssembly.validate(new Uint8Array([
+      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x01, 0x60, 0x03, 0x7b, 0x7b, 0x7b,
+      0x01, 0x7b, 0x03, 0x02, 0x01, 0x00, 0x0a, 0x0d, 0x01, 0x0b, 0x00, 0x20, 0x00, 0x20, 0x01, 0x20,
+      0x02, 0xfd, 0x85, 0x02, 0x0b]));
+    if (typeof WebAssembly === 'object') {
+      mkwLog(`relaxed SIMD ${mkwHasRelaxedSimd() ? 'supported' : 'not supported'} by this browser`);
+    }
+
+    // The game code is over 100 MB: show its download and compile progress.
+    var mkwProgress = (text) => {
+      document.getElementById('mkw-progress').textContent = text;
+      if (text) mkwLog(text);
+    };
+    if (!mkwMissing && WebAssembly.instantiateStreaming) {
+      const instantiateStreaming = WebAssembly.instantiateStreaming;
+      WebAssembly.instantiateStreaming = async (source, imports) => {
+        const response = await source;
+        const megabytes = (bytes) => (bytes / 1048576).toFixed(0);
+        const total = response.headers.has('Content-Encoding') ? 0 : Number(response.headers.get('Content-Length'));
+        let loaded = 0;
+        let shown = 0;
+        const counter = new TransformStream({
+          transform(chunk, controller) {
+            loaded += chunk.byteLength;
+            if (loaded - shown >= 8 << 20) {
+              shown = loaded;
+              mkwProgress(`Downloading game code: ${megabytes(loaded)}${total ? ` / ${megabytes(total)}` : ''} MB`);
+            }
+            controller.enqueue(chunk);
+          },
+          flush() { mkwProgress(`Preparing game code (${megabytes(loaded)} MB)...`); },
+        });
+        const counted = new Response(response.body.pipeThrough(counter),
+          { status: response.status, statusText: response.statusText, headers: response.headers });
+        const started = performance.now();
+        try {
+          const result = await instantiateStreaming(counted, imports);
+          mkwProgress('');
+          mkwLog(`game code ready after ${((performance.now() - started) / 1000).toFixed(1)} s`);
+          return result;
+        } catch (e) {
+          mkwLog(`streaming compile failed (${e}); the page retries without streaming`);
+          throw e;
+        }
+      };
+    }
+
+    // Errors stay visible over the game. The first one is kept: the abort that follows a fatal
+    // error the runtime already described would otherwise replace it with a generic message.
+    var mkwErrorShown = false;
+    var mkwShowError = (text) => {
+      mkwLog(`error shown: ${text}`);
+      if (mkwErrorShown) return;
+      mkwErrorShown = true;
+      document.getElementById('mkw-overlay').hidden = false;
+      document.getElementById('mkw-progress').textContent = '';
+      document.getElementById('mkw-status').textContent = text;
+    };
+
+    // A message over the running game for a while (the loader's storage fallback uses it).
+    var mkwNotice = (text) => {
+      mkwLog(`notice: ${text}`);
+      const notice = document.getElementById('mkw-notice');
+      notice.textContent = text;
+      notice.hidden = false;
+      setTimeout(() => { notice.hidden = true; }, 15000);
+    };
+
+    // Where the page's time goes. The code that awaits times its waits (next display frame,
+    // event-loop turns, timers, disc reads); the rest of the wall time is spent running. CPU
+    // buckets and event counters come from aurora (lib/web_perf.hpp) and the runtime
+    // (platform/web_perf.h). With ?log a summary goes to the server every 5 s, and every frame
+    // over 50 ms gets a "hitch" line saying what that frame did.
+    var mkwPerf = { frames: 0, frame: 0, yield: 0, sleep: 0, disc: 0, switches: 0, switchCost: 0,
+                    discReads: 0, discBytes: 0, discWorst: 0, heap: 0,
+                    cpu: [0, 0, 0], // CPU ms: GX decode, frame encode, audio tick
+                    counts: new Float64Array(64) };
+    // counts[] index -> name; aurora's from 0, the runtime's from 32.
+    var mkwPerfCounters = { pipelinesStarted: 0, pipelinesFinished: 1, pipelineAsyncMs: 2, pipelinesNow: 3,
+                            pipelineNowMs: 4, drawsSkipped: 5, draws: 6, uploadBytes: 7, textureUploads: 8,
+                            textureBytes: 9, batches: 10, audioDropped: 32, audioEmpty: 33,
+                            retracesDisplay: 34, retracesClock: 35 };
+    var mkwPerfFrame; // set below with ?log; aurora calls it as Module.mkwPerfFrame
+    if (new URLSearchParams(location.search).has('log')) {
+      const perf = mkwPerf;
+      const c = mkwPerfCounters;
+      const waits = ['frame', 'yield', 'sleep', 'disc'];
+      const snapshot = () => ({ ...perf, cpu: [...perf.cpu], counts: perf.counts.slice(), at: performance.now() });
+      const kb = (bytes) => (bytes / 1024).toFixed(0);
+      const mb = (bytes) => (bytes / 1048576).toFixed(1);
+
+      // Display refreshes, independent of the game: their rate and the gaps between them.
+      let display = 0;
+      let lastRefresh = 0;
+      const refreshGaps = [];
+      const refreshPeriod = () => (refreshGaps.length ? refreshGaps.slice().sort((a, b) => a - b)[refreshGaps.length >> 1] : 1000 / 60);
+      let window5 = { worstRefresh: 0, lateRefreshes: 0, worstFrame: 0, over20: 0, over33: 0, over50: 0,
+                      hitches: 0, longTasks: 0, longTaskMs: 0 };
+      const tick = (time) => {
+        display++;
+        if (lastRefresh) {
+          const gap = time - lastRefresh;
+          refreshGaps.push(gap);
+          if (refreshGaps.length > 120) refreshGaps.shift();
+          window5.worstRefresh = Math.max(window5.worstRefresh, gap);
+          if (gap > 1.5 * refreshPeriod()) window5.lateRefreshes++;
+        }
+        lastRefresh = time;
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      if (typeof PerformanceObserver === 'function' && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+        new PerformanceObserver((list) => {
+          for (const entry of list.getEntries()) {
+            window5.longTasks++;
+            window5.longTaskMs += entry.duration;
+          }
+        }).observe({ type: 'longtask' });
+      }
+
+      // Called by aurora when a frame is presented (lib/aurora.cpp).
+      let frameStart = null;
+      mkwPerfFrame = (heapBytes) => {
+        const now = performance.now();
+        perf.heap = heapBytes;
+        if (frameStart) {
+          const ms = now - frameStart.at;
+          window5.worstFrame = Math.max(window5.worstFrame, ms);
+          if (ms > 20) window5.over20++;
+          if (ms > 33.4) window5.over33++;
+          if (ms > 50) {
+            window5.over50++;
+            if (window5.hitches++ < 10) {
+              const d = (key) => perf[key] - frameStart[key];
+              const n = (index) => perf.counts[index] - frameStart.counts[index];
+              const waited = waits.reduce((sum, key) => sum + d(key), 0);
+              const cpu = perf.cpu.map((v, i) => v - frameStart.cpu[i]);
+              const parts = [`waits ${waits.map((key) => `${key} ${d(key).toFixed(0)}`).join(' ')} ms`];
+              if (d('discReads')) parts.push(`disc ${d('discReads')} reads ${mb(d('discBytes'))} MB`);
+              parts.push(`cpu gx ${cpu[0].toFixed(1)} encode ${cpu[1].toFixed(1)} audio ${cpu[2].toFixed(1)}, ` +
+                         `rest ${(ms - waited - cpu.reduce((a, b) => a + b, 0)).toFixed(0)} ms`);
+              if (n(c.pipelinesNow)) parts.push(`pipelines compiled now ${n(c.pipelinesNow)} (${n(c.pipelineNowMs).toFixed(0)} ms)`);
+              if (n(c.pipelinesStarted) || n(c.pipelinesFinished)) {
+                parts.push(`pipelines started ${n(c.pipelinesStarted)} finished ${n(c.pipelinesFinished)}`);
+              }
+              if (n(c.drawsSkipped)) parts.push(`draws skipped ${n(c.drawsSkipped)}`);
+              if (n(c.textureUploads)) parts.push(`textures ${n(c.textureUploads)} (${kb(n(c.textureBytes))} KB)`);
+              if (n(c.batches) > 1) parts.push(`batches ${n(c.batches)}`);
+              if (n(c.audioDropped) || n(c.audioEmpty)) parts.push(`audio dropped ${n(c.audioDropped)} ran dry ${n(c.audioEmpty)}`);
+              mkwLog(`hitch: frame ${perf.frames} took ${ms.toFixed(0)} ms: ${parts.join('; ')}`);
+            }
+          }
+        }
+        frameStart = snapshot();
+      };
+
+      let last = snapshot();
+      last.display = 0;
+      setInterval(() => {
+        const now = performance.now();
+        const span = now - last.at;
+        const d = (key) => perf[key] - last[key];
+        const n = (index) => perf.counts[index] - last.counts[index];
+        const waiting = waits.reduce((sum, key) => sum + d(key), 0);
+        const frames = d('frames');
+        const perSecond = (value) => (value * 1000 / span).toFixed(1);
+        const perFrame = (value, digits = 1) => (frames ? (value / frames).toFixed(digits) : '-');
+        mkwLog(`perf: ${perSecond(frames)} game fps, ${perSecond(display - last.display)} display fps, busy ` +
+          `${(100 * (span - waiting) / span).toFixed(0)}%` +
+          (frames ? ` (${((span - waiting) / frames).toFixed(1)} ms/frame)` : '') +
+          `, waiting ms: ${waits.map((key) => `${key} ${d(key).toFixed(0)}`).join(' ')}, ` +
+          `${perSecond(d('switches'))} thread switches/s costing ${d('switchCost').toFixed(0)} ms` +
+          (d('switches') ? ` (${(1000 * d('switchCost') / d('switches')).toFixed(0)} us each)` : '') +
+          `, cpu ms per frame: ` + ['gx decode', 'encode', 'audio'].map((name, i) =>
+            `${name} ${perFrame(perf.cpu[i] - last.cpu[i])}`).join(' '));
+        const w = window5;
+        mkwLog(`perf frames: worst ${w.worstFrame.toFixed(0)} ms, over 20 ms ${w.over20}, over 33 ms ${w.over33}, ` +
+          `over 50 ms ${w.over50}; refreshes: worst gap ${w.worstRefresh.toFixed(0)} ms, late ${w.lateRefreshes}` +
+          ` (median ${refreshPeriod().toFixed(1)} ms); retraces by display ${n(c.retracesDisplay)}, by clock ${n(c.retracesClock)}` +
+          (w.longTasks ? `; long tasks ${w.longTasks} (${w.longTaskMs.toFixed(0)} ms)` : ''));
+        const finished = n(c.pipelinesFinished);
+        const inFlight = perf.counts[c.pipelinesStarted] - perf.counts[c.pipelinesFinished];
+        mkwLog(`perf gpu per frame: draws ${perFrame(n(c.draws), 0)}, skipped ${perFrame(n(c.drawsSkipped), 2)}, ` +
+          `uploads ${frames ? kb(n(c.uploadBytes) / frames) : '-'} KB, textures ${perFrame(n(c.textureUploads), 2)} ` +
+          `(${frames ? kb(n(c.textureBytes) / frames) : '-'} KB), batches ${perFrame(n(c.batches), 2)}; ` +
+          `pipelines: started ${n(c.pipelinesStarted)}, finished ${finished}` +
+          (finished ? ` (avg ${(n(c.pipelineAsyncMs) / finished).toFixed(0)} ms)` : '') +
+          `, compiled now ${n(c.pipelinesNow)} (${n(c.pipelineNowMs).toFixed(0)} ms), compiling ${inFlight}`);
+        mkwLog(`perf disc: ${d('discReads')} reads, ${mb(d('discBytes'))} MB, worst ${perf.discWorst.toFixed(0)} ms; ` +
+          `audio: dropped ${n(c.audioDropped)}, ran dry ${n(c.audioEmpty)}` +
+          (Module.SDL3?.audioContext ? ` (output ${Module.SDL3.audioContext.state}, ${Module.SDL3.audioContext.sampleRate} Hz)` : ' (no output yet)') +
+          `; memory: wasm ${mb(perf.heap)} MB` +
+          (performance.memory ? `, js heap and buffers ${mb(performance.memory.usedJSHeapSize)} MB` : ''));
+        perf.discWorst = 0;
+        window5 = { worstRefresh: 0, lateRefreshes: 0, worstFrame: 0, over20: 0, over33: 0, over50: 0,
+                    hitches: 0, longTasks: 0, longTaskMs: 0 };
+        last = snapshot();
+        last.display = display;
+      }, 5000);
+    }
+
+    var Module = {
+      canvas: document.getElementById('canvas'),
+      mkwPerf,
+      mkwPerfFrame,
+      mkwShowError,
+      mkwNotice,
+      mkwProgress,
+      print: (text) => { console.log(text); mkwLog(text); },
+      printErr: (text) => { console.error(text); mkwLog(text); },
+      monitorRunDependencies: (left) => mkwLog(`startup steps left: ${left}`),
+      // Hide the status overlay once the game runs.
+      onRuntimeInitialized: () => {
+        mkwLog('runtime initialized');
+        document.getElementById('mkw-overlay').hidden = !mkwMissing;
+      },
+      // A fatal error can happen in a browser callback while the game itself is suspended, which
+      // would otherwise just freeze the picture. Say so on the page.
+      onAbort: (what) => {
+        mkwLog(`abort: ${what}`);
+        const relaxedSimd = /CompileError/.test(String(what)) && !mkwHasRelaxedSimd();
+        mkwShowError(mkwMissing ||
+          (relaxedSimd
+            ? 'This browser does not support relaxed SIMD, which this build uses. It needs the build made with -DMKW_WEB_FMA=soft.'
+            : 'The game stopped because of an error' + (what ? ': ' + what : '') +
+              '. The browser console (F12) has the details.'));
+      },
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "isa/big_endian.h"
+#include "platform/web_mounts.h"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -287,12 +289,45 @@ inline constexpr const char* Describe(HostReadFailure failure) noexcept {
 // Read into private storage first and publish it only after the complete host
 // range has been obtained. Callers can therefore leave a guest DMA destination
 // untouched for every failure, including a host file truncated after indexing.
+#if defined(__EMSCRIPTEN__)
+// The web build's game data is on the MKWDISCFS mount (runtime/web/disc_fs.js). Its
+// reads suspend through JSPI while the page fetches the range, instead of blocking in std::ifstream.
+extern "C" int mkw_web_disc_read(const char* path, uint32_t offset, uint32_t length, uint8_t* destination);
+#endif
+
 inline bool ReadExact(const std::filesystem::path& hostPath,
                       uint64_t offset,
                       uint32_t length,
                       std::vector<uint8_t>& destination,
                       HostReadFailure& failure) {
     failure = HostReadFailure::None;
+
+#if defined(__EMSCRIPTEN__)
+    const std::string webPath = hostPath.generic_string();
+    const std::string_view discMount = WebMounts::kDisc;
+    if (webPath.size() > discMount.size() && webPath.compare(0, discMount.size(), discMount) == 0 &&
+        webPath[discMount.size()] == '/') {
+        if (offset > std::numeric_limits<uint32_t>::max()) {
+            failure = HostReadFailure::BadOffset;
+            return false;
+        }
+        std::vector<uint8_t> staged(length);
+        switch (mkw_web_disc_read(webPath.c_str(), static_cast<uint32_t>(offset), length, staged.data())) {
+        case 0:
+            destination = std::move(staged);
+            return true;
+        case 2:
+            failure = HostReadFailure::BadOffset;
+            return false;
+        case 3:
+            failure = HostReadFailure::ShortRead;
+            return false;
+        default:
+            failure = HostReadFailure::MissingFile;
+            return false;
+        }
+    }
+#endif
 
     std::ifstream file(hostPath, std::ios::binary);
     if (!file.is_open()) {
