@@ -3,6 +3,7 @@
 #include "gx.hpp"
 // MaxInterpolatedFrames / FrameInterpolationDrawIdentity, and the interpolation API that build_uniform feeds.
 #include "frame_interpolation.hpp"
+#include "ubershader.hpp"
 
 namespace aurora::gx {
 struct UniformRanges {
@@ -12,8 +13,9 @@ struct UniformRanges {
 
 ShaderInfo build_shader_info(const ShaderConfig& config) noexcept;
 Light prepare_shader_light(Light light) noexcept;
+// `uber`: the draw uses the ubershader; its packed config follows the uniforms (see ubershader.hpp).
 UniformRanges build_uniform(const ShaderInfo& info, uint32_t vtxStart, const BindGroupRanges& ranges,
                             const FrameInterpolationDrawIdentity& drawIdentity, bool perspective,
-                            uint16_t usedPnMtxMask = 1) noexcept;
+                            uint16_t usedPnMtxMask = 1, const UberConfig* uber = nullptr) noexcept;
 u8 color_channel(GXChannelID id) noexcept;
 }; // namespace aurora::gx

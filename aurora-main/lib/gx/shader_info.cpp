@@ -584,10 +584,11 @@ static Mat4x4<float> effective_projection() noexcept {
 
 UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges,
                             const FrameInterpolationDrawIdentity& drawIdentity, bool perspective,
-                            uint16_t usedPnMtxMask) noexcept {
+                            uint16_t usedPnMtxMask, const UberConfig* uber) noexcept {
   ZoneScoped;
 
-  auto [buf, range] = gfx::map_uniform(info.uniformSize);
+  const u32 uberBytes = uber != nullptr ? uber->wordCount * 4 : 0;
+  auto [buf, range] = gfx::map_uniform(info.uniformSize + uberBytes);
 
   const auto& layout = info.matrixLayout;
   // `postex_mtx[current_pnmtx]` indexes raw matrix memory, so a current-matrix index of 10 or more selects a texture matrix; the normal array only covers the position rows and clamps.
@@ -612,6 +613,11 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
   stage_f32(g_gxState.logicalViewport.width);
   stage_f32(g_gxState.logicalViewport.height);
   std::memset(staged.data() + stagedSize, 0, 8); // pad
+  if (uber != nullptr) {
+    // The ubershader finds its packed config (after the uniforms) through pad.x, in vec4 units.
+    const u32 configVec4 = info.uniformSize / 16;
+    std::memcpy(staged.data() + stagedSize, &configVec4, sizeof(configVec4));
+  }
   stagedSize += 8;
   for (const auto& vaRange : ranges.vaRanges) {
     stage_u32(vaRange.offset);
@@ -726,6 +732,10 @@ UniformRanges build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGrou
     const auto& tex = get_texture(static_cast<GXTexMapID>(i));
     // CHECK(tex, "unbound texture {}", i);
     buf.append(texture_size_bias(tex));
+  }
+  if (uber != nullptr) {
+    buf.append_zeroes(info.uniformSize - buf.size());
+    buf.append(uber->words.data(), uberBytes);
   }
 
   if (!perspective || frame_interpolation_fps() == 0) {

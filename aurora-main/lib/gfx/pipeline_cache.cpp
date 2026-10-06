@@ -5,6 +5,8 @@
 #include "../fs_helper.hpp"
 #include "../sqlite_utils.hpp"
 #include "../webgpu/gpu.hpp"
+#include "../gx/shader_info.hpp"
+#include "../gx/ubershader.hpp"
 #ifdef AURORA_WEBGPU_BROWSER
 #include "../web_perf.hpp"
 #endif
@@ -84,6 +86,12 @@ static std::condition_variable g_pipelineCv;
 static absl::flat_hash_map<PipelineRef, CachedPipeline> g_pipelines;
 static std::deque<PendingPipeline> g_priorityPipelines;
 static std::deque<PendingPipeline> g_backgroundPipelines;
+// Hybrid-mode specialised pipelines waiting for a quiet frame (find_gx_pipeline, deferrable); only
+// filled when gx::defer_specialised_pipelines() is set. Not counted against MaxQueuedPipelineBuilds.
+static std::deque<PendingPipeline> g_deferredPipelines;
+// A frame with fewer draws than this is a loading screen, a fade or a movie: deferred pipelines
+// compile then. Measured in Mario Kart Wii: 0-4 draws on those, 90+ in menus, 200-450 in races.
+constexpr uint32_t QuietFrameDraws = 16;
 static absl::flat_hash_set<PipelineRef> g_pendingPipelines;
 #ifdef AURORA_WEBGPU_BROWSER
 // The browser build has no compile threads. Queued pipelines compile through
@@ -416,19 +424,20 @@ static PendingPipeline* touch_pending_pipeline(PipelineRef hash, bool prioritize
     return &*priorityIt;
   }
 
-  auto backgroundIt = find_pending_pipeline(g_backgroundPipelines, hash);
-  if (backgroundIt == g_backgroundPipelines.end()) {
-    return nullptr;
+  for (auto* queue : {&g_backgroundPipelines, &g_deferredPipelines}) {
+    auto it = find_pending_pipeline(*queue, hash);
+    if (it == queue->end()) {
+      continue;
+    }
+    if (!prioritize) {
+      return &*it;
+    }
+    g_priorityPipelines.emplace_back(std::move(*it));
+    queue->erase(it);
+    g_pipelineCv.notify_all();
+    return &g_priorityPipelines.back();
   }
-
-  if (!prioritize) {
-    return &*backgroundIt;
-  }
-
-  g_priorityPipelines.emplace_back(std::move(*backgroundIt));
-  g_backgroundPipelines.erase(backgroundIt);
-  g_pipelineCv.notify_all();
-  return &g_priorityPipelines.back();
+  return nullptr;
 }
 
 // A persistent resolve is the last chance to complete its producing draw, so promote its queued
@@ -444,14 +453,17 @@ static bool promote_pending_pipeline_for_wait(PipelineRef hash) {
     return true;
   }
 
-  auto backgroundIt = find_pending_pipeline(g_backgroundPipelines, hash);
-  if (backgroundIt == g_backgroundPipelines.end()) {
-    return false;
+  for (auto* queue : {&g_backgroundPipelines, &g_deferredPipelines}) {
+    auto it = find_pending_pipeline(*queue, hash);
+    if (it == queue->end()) {
+      continue;
+    }
+    PendingPipeline pending = std::move(*it);
+    queue->erase(it);
+    g_priorityPipelines.emplace_front(std::move(pending));
+    return true;
   }
-  PendingPipeline pending = std::move(*backgroundIt);
-  g_backgroundPipelines.erase(backgroundIt);
-  g_priorityPipelines.emplace_front(std::move(pending));
-  return true;
+  return false;
 }
 
 template <typename Queue>
@@ -466,7 +478,8 @@ static bool remove_pending_pipeline(Queue& queue, PipelineRef hash) {
 
 template <typename PipelineConfig>
 static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
-                                      bool persist, std::optional<uint32_t> firstFrameUsedOverride) {
+                                      bool persist, std::optional<uint32_t> firstFrameUsedOverride,
+                                      bool deferrable = false) {
   ZoneScoped;
 
   const PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
@@ -482,6 +495,11 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
     const bool deferGxPipeline =
         (g_hasPipelineThread || AsyncPipelines) && g_pipelineFrameActive && type == ShaderType::GX;
     const bool skipUnreadyGxPipeline = deferGxPipeline && g_skipUnreadyGxPipelines.load(std::memory_order_relaxed);
+    // Deferred pipelines wait for a quiet frame and never compile synchronously: their draws have the
+    // ubershader to fall back on.
+    const bool toDeferred = deferrable && type == ShaderType::GX && gx::defer_specialised_pipelines();
+    // The cap bounds work the next frames will do; deferred pipelines are not part of that.
+    const size_t activePending = g_pendingPipelines.size() - g_deferredPipelines.size();
     auto pipelineIt = g_pipelines.find(hash);
     if (pipelineIt != g_pipelines.end()) {
       if (persist && firstFrameUsed < pipelineIt->second.firstFrameUsed) {
@@ -489,21 +507,32 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
         cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
       }
     } else if (g_pendingPipelines.contains(hash)) {
-      auto* pending = touch_pending_pipeline(hash, g_pipelineFrameActive);
+      auto* pending = touch_pending_pipeline(hash, g_pipelineFrameActive && !toDeferred);
       if (pending != nullptr && firstFrameUsed < pending->firstFrameUsed) {
         pending->firstFrameUsed = firstFrameUsed;
         if (persist) {
           cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
         }
       }
-      if (g_pipelineFrameActive && !deferGxPipeline) {
+      if (g_pipelineFrameActive && !deferGxPipeline && !toDeferred) {
         syncCreate = true;
       }
     } else {
-      if (g_pipelineFrameActive && !deferGxPipeline) {
+      if (g_pipelineFrameActive && !deferGxPipeline && !toDeferred) {
         syncCreate = true;
+      } else if (toDeferred) {
+        g_deferredPipelines.emplace_back(PendingPipeline{
+            .hash = hash,
+            .firstFrameUsed = firstFrameUsed,
+            .create = std::move(cb),
+        });
+        g_pendingPipelines.insert(hash);
+        ++queuedPipelines;
+        if (persist) {
+          cacheWrite = make_pipeline_cache_write(type, hash, config, firstFrameUsed);
+        }
       } else {
-        if (!cachePreload && deferGxPipeline && g_pendingPipelines.size() >= MaxQueuedPipelineBuilds &&
+        if (!cachePreload && deferGxPipeline && activePending >= MaxQueuedPipelineBuilds &&
             !g_backgroundPipelines.empty()) {
           g_pendingPipelines.erase(g_backgroundPipelines.back().hash);
           g_backgroundPipelines.pop_back();
@@ -512,7 +541,7 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
 
         // Keep the pipeline queued past the cap rather than compiling synchronously: the recorded draw
         // references this hash forever, and dropping it baked one-shot EFB copies incomplete.
-        if (!cachePreload && g_pendingPipelines.size() >= MaxQueuedPipelineBuilds && !skipUnreadyGxPipeline) {
+        if (!cachePreload && activePending >= MaxQueuedPipelineBuilds && !skipUnreadyGxPipeline) {
           syncCreate = true;
         } else {
           auto& targetQueue = deferGxPipeline ? g_priorityPipelines : g_backgroundPipelines;
@@ -538,6 +567,7 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
       std::scoped_lock guard{g_pipelineMutex};
       removedPending = remove_pending_pipeline(g_priorityPipelines, hash);
       removedPending = remove_pending_pipeline(g_backgroundPipelines, hash) || removedPending;
+      removedPending = remove_pending_pipeline(g_deferredPipelines, hash) || removedPending;
       if (removedPending) {
         g_pendingPipelines.erase(hash);
       }
@@ -1083,7 +1113,7 @@ static void compile_pipeline_now(PipelineRef hash) {
   std::optional<PendingPipeline> pending;
   {
     std::lock_guard lock{g_pipelineMutex};
-    for (auto* queue : {&g_priorityPipelines, &g_backgroundPipelines}) {
+    for (auto* queue : {&g_priorityPipelines, &g_backgroundPipelines, &g_deferredPipelines}) {
       const auto it = find_pending_pipeline(*queue, hash);
       if (it != queue->end()) {
         pending = std::move(*it);
@@ -1134,7 +1164,7 @@ static void pipeline_worker() {
       std::unique_lock lock{g_pipelineMutex};
       g_pipelineCv.wait(lock, [] {
         return !g_priorityPipelines.empty() ||
-               (!g_backgroundPipelines.empty() &&
+               ((!g_backgroundPipelines.empty() || !g_deferredPipelines.empty()) &&
                 g_activeBackgroundPipelineWorkers < MaxBackgroundPipelineWorkers) ||
                g_pipelineThreadEnd;
       });
@@ -1142,7 +1172,9 @@ static void pipeline_worker() {
         return;
       }
       background = g_priorityPipelines.empty();
-      auto& source = background ? g_backgroundPipelines : g_priorityPipelines;
+      auto& source = !background                      ? g_priorityPipelines
+                     : !g_backgroundPipelines.empty() ? g_backgroundPipelines
+                                                      : g_deferredPipelines;
       pending = std::move(source.front());
       source.pop_front();
       if (background) {
@@ -1168,15 +1200,29 @@ static void build_synchronous_pipelines_for_frame() {
   while (g_pipelinesPerFrame < BuildPipelinesPerFrame) {
 #endif
     PendingPipeline pending;
+    bool deferred = false;
     {
       std::lock_guard lock{g_pipelineMutex};
-      if (g_priorityPipelines.empty() && g_backgroundPipelines.empty()) {
+      // g_drawCallCount still holds this batch's draws: end_pipeline_frame runs at the end of a batch.
+      const bool quietFrame = g_drawCallCount < QuietFrameDraws;
+      if (g_priorityPipelines.empty() && g_backgroundPipelines.empty() &&
+          (g_deferredPipelines.empty() || !quietFrame)) {
         return;
       }
-      auto& source = !g_priorityPipelines.empty() ? g_priorityPipelines : g_backgroundPipelines;
+      deferred = g_priorityPipelines.empty() && g_backgroundPipelines.empty();
+      auto& source = !g_priorityPipelines.empty()   ? g_priorityPipelines
+                     : !g_backgroundPipelines.empty() ? g_backgroundPipelines
+                                                      : g_deferredPipelines;
       pending = std::move(source.front());
       source.pop_front();
     }
+#ifdef AURORA_WEBGPU_BROWSER
+    if (deferred) {
+      web_perf::count(web_perf::kDeferredStarted);
+    }
+#else
+    (void)deferred;
+#endif
     compile_pending_pipeline(std::move(pending));
     ++g_pipelinesPerFrame;
   }
@@ -1231,6 +1277,26 @@ static void load_pipeline_cache_entries(ShaderType type, uint32_t configVersion,
     if constexpr (std::is_same_v<PipelineConfig, gx::PipelineConfig>) {
       if (!gx::valid_pipeline_config(config)) {
         Log.warn("Skipping invalid cached GX pipeline configuration");
+        continue;
+      }
+      const auto mode = gx::ubershader_mode();
+      if (gx::is_ubershader_marker(config.shaderConfig)) {
+        if (mode == gx::UbershaderMode::Off) {
+          continue; // recorded by an older build that persisted the ubershader's own pipelines
+        }
+      } else if (mode != gx::UbershaderMode::Off &&
+                 gx::pack_ubershader_config(config.shaderConfig, gx::build_shader_info(config.shaderConfig))
+                         .wordCount != 0) {
+        // Prewarm the ubershader's pipeline for this fixed-function state first (many cached
+        // configurations share one): it can draw them all as soon as it exists.
+        PipelineConfig uberConfig = config;
+        uberConfig.shaderConfig = gx::ubershader_marker_config();
+        find_pipeline_impl(type, uberConfig, [=] { return create(uberConfig); }, false, firstFrameUsed);
+        if (mode == gx::UbershaderMode::Hybrid) {
+          // Then the specialised one, which draws it cheaper; deferred to quiet frames where compiling
+          // stalls the page.
+          find_pipeline_impl(type, config, [=] { return create(config); }, false, firstFrameUsed, true);
+        }
         continue;
       }
     }
@@ -1307,6 +1373,16 @@ PipelineRef find_pipeline(ShaderType type, const gx::PipelineConfig& config, New
   return find_pipeline_impl(type, config, std::move(cb), true, std::nullopt);
 }
 
+PipelineRef find_gx_pipeline(const gx::PipelineConfig& config, NewPipelineCallback&& cb, bool persist,
+                             bool deferrable) {
+  return find_pipeline_impl(ShaderType::GX, config, std::move(cb), persist, std::nullopt, deferrable);
+}
+
+bool pipeline_ready(PipelineRef ref) {
+  std::scoped_lock lock{g_pipelineMutex};
+  return g_pipelines.contains(ref);
+}
+
 void initialize_pipeline_cache() {
   g_pipelineCacheBroken = false;
   g_pipelineCacheWriterStop = false;
@@ -1357,6 +1433,7 @@ void shutdown_pipeline_cache() {
   g_pipelines.clear();
   g_priorityPipelines.clear();
   g_backgroundPipelines.clear();
+  g_deferredPipelines.clear();
   g_pendingPipelines.clear();
 #ifdef AURORA_WEBGPU_BROWSER
   g_asyncPipelines.clear();

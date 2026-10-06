@@ -27,6 +27,16 @@ uint32_t queued_pipeline_count() noexcept;
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
+// GX pipelines of the ubershader's hybrid mode (gx/ubershader.hpp). `persist` records the configuration
+// in the pipeline cache database (the ubershader's own pipelines are derived from the specialised
+// ones, so they are not). `deferrable`: when gx::defer_specialised_pipelines() is set, the pipeline
+// is queued behind all other work and compiled only on frames with few draws (loading screens),
+// because compiling stalls the page there; its draws use the ubershader until then.
+PipelineRef find_gx_pipeline(const gx::PipelineConfig& config, NewPipelineCallback&& cb, bool persist,
+                             bool deferrable);
+// Whether the pipeline has compiled (it never becomes unready again).
+bool pipeline_ready(PipelineRef ref);
+
 bool wait_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
 bool try_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
 // Waits indefinitely for a draw about to be committed to a persistent texture with no re-issue

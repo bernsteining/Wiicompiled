@@ -39,6 +39,8 @@ enum Counter : int {
   kBatches = 10,          // staging batches submitted (more than one a frame: capacity splits, EFB copies)
   kGpuFrames = 11,        // frames whose GPU work reported done
   kGpuMs = 12,            // their scene's submit-to-done time, summed (an upper bound on its GPU time)
+  kUberDraws = 13,        // draws using the ubershader (hybrid: their specialised pipeline is not ready)
+  kDeferredStarted = 14,  // deferred specialised pipelines started on a quiet frame
 };
 
 // A frame's scene was submitted at `submitted` (emscripten_get_now()) and the GPU reported it done

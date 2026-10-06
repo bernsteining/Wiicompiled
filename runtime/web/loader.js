@@ -603,12 +603,24 @@
     const webkitOnly = /AppleWebKit/.test(agent) && !/Chrome|Chromium|Edg\//.test(agent);
     const seed = asked === 'native' || asked === 'web' ? asked : webkitOnly ? 'native' : 'web';
     FS.writeFile('/initial_pipeline_cache.db', FS.readFile(`/app/pipeline/${seed}.db`));
+    const params = new URLSearchParams(location.search);
+    // aurora's ubershader (lib/gx/ubershader.hpp). ?uber (or ?uber=hybrid): a draw whose specialised
+    // pipeline has not compiled yet uses it instead of being skipped or stalling the page.
+    // ?uber=all: every draw it covers uses it (fewest compiles; ~2.5x the GPU time on an iPad).
+    const uber = params.has('uber') ? params.get('uber') || 'hybrid' : 'off';
+    if (uber === 'hybrid' || uber === 'all') Module['mkwUbershader'] = uber;
+    // Hybrid only: Safari stalls the page for every compile, so its missing specialised pipelines
+    // wait for a loading screen (frames with few draws); ?defer=0 or ?defer=1 overrides.
+    const defer = params.has('defer') ? params.get('defer') !== '0' : webkitOnly;
+    if (defer) Module['mkwDeferPipelines'] = true;
     // How many asynchronous compiles aurora keeps going: Safari stalls the page for each, so a
     // few at a time keep the screen moving between them; ?inflight=N overrides.
-    const inFlight = Number(new URLSearchParams(location.search).get('inflight')) || (webkitOnly ? 4 : 0);
+    const inFlight = Number(params.get('inflight')) || (webkitOnly ? 4 : 0);
     if (inFlight) Module['mkwPipelinesInFlight'] = inFlight;
     out(`[web] pipeline seed: ${seed}${asked ? ' (?seed)' : webkitOnly ? ' (WebKit)' : ''}` +
-        (inFlight ? `, ${inFlight} compiles in flight` : ''));
+        (inFlight ? `, ${inFlight} compiles in flight` : '') +
+        (Module['mkwUbershader'] ? `, ubershader ${Module['mkwUbershader']}` +
+         (Module['mkwUbershader'] === 'hybrid' && defer ? ' (specialised compiles deferred)' : '') : ''));
   }
 
   // ?resetpipelines: forget the pipelines this browser learned (aurora's Cache/pipeline_cache.db

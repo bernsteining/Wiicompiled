@@ -4,6 +4,7 @@
 #include "command_processor.hpp"
 
 #include "../gfx/common.hpp"
+#include "../gfx/pipeline_cache.hpp"
 #include "../dolphin/gx/__gx.h"
 #include "../gfx/texture_replacement.hpp"
 #include "dolphin/gx/GXAurora.h"
@@ -11,6 +12,7 @@
 #include "gx_fmt.hpp"
 #include "pipeline.hpp"
 #include "shader_info.hpp"
+#include "ubershader.hpp"
 #include "../internal.hpp"
 
 #include <absl/container/flat_hash_map.h>
@@ -2051,6 +2053,14 @@ struct CachedPipelineState {
   // Carried here so the draw can be recorded without keeping the PipelineConfig that produced it alive; it is the only field of the config the draw itself still needs.
   u32 dstAlpha = UINT32_MAX;
   ShaderInfo shaderInfo{};
+  // Set when the ubershader covers this configuration: its pipeline for this fixed-function state, and
+  // the packed ShaderConfig a draw using it appends to its uniforms.
+  gfx::PipelineRef uberRef = 0;
+  UberConfig uber{};
+  // Hybrid mode: draws use the ubershader until `ref` (the specialised pipeline) has compiled; this
+  // latches once it has, so the check stops costing a lookup. Always true in UbershaderMode::All.
+  mutable bool useSpecialised = false;
+  bool alwaysUber = false;
 };
 
 static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& config) {
@@ -2072,11 +2082,30 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
   entry.valid = true;
   entry.config = config;
   entry.state = {
-      .ref = gfx::pipeline_ref(config),
       .configHash = hash,
       .dstAlpha = config.dstAlpha,
       .shaderInfo = build_shader_info(config.shaderConfig),
   };
+  const auto mode = ubershader_mode();
+  if (mode != UbershaderMode::Off) {
+    entry.state.uber = pack_ubershader_config(config.shaderConfig, entry.state.shaderInfo);
+  }
+  if (entry.state.uber.wordCount == 0) {
+    entry.state.ref = gfx::pipeline_ref(config);
+    entry.state.useSpecialised = true;
+    return entry.state;
+  }
+  // Pipelines drawn with the ubershader differ only by their fixed-function state. They are derived
+  // from the specialised configurations the cache records, so they are not recorded themselves.
+  PipelineConfig uberConfig = config;
+  uberConfig.shaderConfig = ubershader_marker_config();
+  entry.state.uberRef = gfx::find_gx_pipeline(uberConfig, [=] { return create_pipeline(uberConfig); }, false, false);
+  if (mode == UbershaderMode::All) {
+    entry.state.ref = entry.state.uberRef;
+    entry.state.alwaysUber = true;
+  } else {
+    entry.state.ref = gfx::find_gx_pipeline(config, [=] { return create_pipeline(config); }, true, true);
+  }
   return entry.state;
 }
 
@@ -2307,7 +2336,19 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
 
   const auto bindGroups = build_bind_groups(info);
 
-  const auto pipeline = pipelineState.ref;
+  auto pipeline = pipelineState.ref;
+  const UberConfig* uber = nullptr;
+  if (!pipelineState.useSpecialised) UNLIKELY {
+    if (!pipelineState.alwaysUber && gfx::pipeline_ready(pipelineState.ref)) {
+      pipelineState.useSpecialised = true;
+    } else {
+      pipeline = pipelineState.uberRef;
+      uber = &pipelineState.uber;
+#ifdef AURORA_WEBGPU_BROWSER
+      web_perf::count(web_perf::kUberDraws);
+#endif
+    }
+  }
 
   // Draw-identity hashing only feeds frame interpolation, and only for perspective draws: build_uniform reads the identity exclusively past its `!perspective || frame_interpolation_fps() == 0` early-out.
   FrameInterpolationDrawIdentity drawIdentity{};
@@ -2329,7 +2370,7 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   }
   const auto uniformRanges =
       build_uniform(info, vertRange.offset, ranges, drawIdentity, interpolationIdentityActive,
-                    usedPnMtxMask);
+                    usedPnMtxMask, uber);
   s_lastDrawRecordedInterpolation = interpolationIdentityActive;
 
   uint32_t instanceCount = 1;

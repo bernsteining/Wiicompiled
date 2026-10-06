@@ -3,6 +3,7 @@
 #include "../webgpu/gpu.hpp"
 #include "gx_fmt.hpp"
 #include "shader_info.hpp"
+#include "ubershader.hpp"
 #include "tracy/Tracy.hpp"
 
 #include <condition_variable>
@@ -56,7 +57,8 @@ wgpu::ShaderModule cached_shader_module(const ShaderConfig& config) {
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   ZoneScoped;
-  const auto shader = cached_shader_module(config.shaderConfig);
+  const auto shader = is_ubershader_marker(config.shaderConfig) ? ubershader_module()
+                                                                 : cached_shader_module(config.shaderConfig);
   return build_pipeline(config, {}, shader, "GX Pipeline");
 }
 

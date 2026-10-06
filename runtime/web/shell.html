@@ -176,7 +176,8 @@
     // counts[] index -> name; aurora's from 0, the runtime's from 32.
     var mkwPerfCounters = { pipelinesStarted: 0, pipelinesFinished: 1, pipelineAsyncMs: 2, pipelinesNow: 3,
                             pipelineNowMs: 4, drawsSkipped: 5, draws: 6, uploadBytes: 7, textureUploads: 8,
-                            textureBytes: 9, batches: 10, gpuFrames: 11, gpuMs: 12, audioDropped: 32, audioEmpty: 33,
+                            textureBytes: 9, batches: 10, gpuFrames: 11, gpuMs: 12, uberDraws: 13,
+                            deferredStarted: 14, audioDropped: 32, audioEmpty: 33,
                             retracesDisplay: 34, retracesClock: 35 };
     var mkwPerfFrame; // set below with ?log; aurora calls it as Module.mkwPerfFrame
     if (new URLSearchParams(location.search).has('log')) {
@@ -242,6 +243,8 @@
                 parts.push(`pipelines started ${n(c.pipelinesStarted)} finished ${n(c.pipelinesFinished)}`);
               }
               if (n(c.drawsSkipped)) parts.push(`draws skipped ${n(c.drawsSkipped)}`);
+              if (n(c.uberDraws)) parts.push(`ubershader draws ${n(c.uberDraws)}`);
+              if (n(c.deferredStarted)) parts.push(`deferred compiles ${n(c.deferredStarted)}`);
               if (n(c.textureUploads)) parts.push(`textures ${n(c.textureUploads)} (${kb(n(c.textureBytes))} KB)`);
               if (n(c.batches) > 1) parts.push(`batches ${n(c.batches)}`);
               if (n(c.audioDropped) || n(c.audioEmpty)) parts.push(`audio dropped ${n(c.audioDropped)} ran dry ${n(c.audioEmpty)}`);
@@ -285,7 +288,9 @@
           (finished ? ` (avg ${(n(c.pipelineAsyncMs) / finished).toFixed(0)} ms)` : '') +
           `, compiled now ${n(c.pipelinesNow)} (${n(c.pipelineNowMs).toFixed(0)} ms), compiling ${inFlight}; ` +
           `gpu submit to done ${n(c.gpuFrames) ? (n(c.gpuMs) / n(c.gpuFrames)).toFixed(1) : '-'} ms avg, ` +
-          `worst ${perf.gpuWorst.toFixed(1)} ms`);
+          `worst ${perf.gpuWorst.toFixed(1)} ms` +
+          (Module.mkwUbershader ? `; ubershader ${Module.mkwUbershader}: ${perFrame(n(c.uberDraws), 1)} draws/frame, ` +
+           `deferred compiles started ${n(c.deferredStarted)}` : ''));
         mkwLog(`perf disc: ${d('discReads')} reads, ${mb(d('discBytes'))} MB, worst ${perf.discWorst.toFixed(0)} ms; ` +
           `audio: dropped ${n(c.audioDropped)}, ran dry ${n(c.audioEmpty)}` +
           (Module.SDL3?.audioContext ? ` (output ${Module.SDL3.audioContext.state}, ${Module.SDL3.audioContext.sampleRate} Hz)` : ' (no output yet)') +
